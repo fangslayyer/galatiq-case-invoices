@@ -1,8 +1,8 @@
 """File loaders: turn any supported invoice file into raw text.
 
-Deliberately dumb — no interpretation happens here. Structured formats are
-passed through verbatim so the Extractor agent (or the offline parser) sees
-exactly what the vendor sent, messy or not.
+Deliberately dumb — no interpretation happens here. Every format is passed
+through verbatim so the Extractor agent sees exactly what the vendor sent,
+messy or not; understanding it is entirely the LLM's job.
 """
 
 from __future__ import annotations

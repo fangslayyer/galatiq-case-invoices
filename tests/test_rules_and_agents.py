@@ -2,7 +2,6 @@
 self-correction paths that clean fixtures never trigger."""
 
 from invoiceflow.agents import run_approver, run_critic, run_validator
-from invoiceflow.llm import StubChatModel
 from invoiceflow.models import (
     ApprovalDecision,
     ApprovalStatus,
@@ -14,6 +13,7 @@ from invoiceflow.models import (
 )
 from invoiceflow.rules import evaluate_rules
 from invoiceflow.validation import ValidationContext
+from tests.fakes import FakeBrain
 from tests.test_validation import make_invoice
 
 
@@ -49,7 +49,7 @@ class TestRuleEngine:
 
 
 class TestApprovalAgents:
-    llm = StubChatModel()
+    llm = FakeBrain()
 
     def test_approver_rejects_on_must_reject(self):
         inv, rep = make_invoice(), make_report(critical())
@@ -94,7 +94,7 @@ class TestApprovalAgents:
 class TestValidatorAgent:
     def test_tool_loop_runs_all_checks(self, db):
         ctx = ValidationContext(make_invoice(), db)
-        report = run_validator(StubChatModel(), ctx)
+        report = run_validator(FakeBrain(), ctx)
         assert set(report.tools_used) == {
             "check_inventory",
             "verify_arithmetic",

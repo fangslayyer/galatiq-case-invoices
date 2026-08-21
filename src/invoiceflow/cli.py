@@ -41,7 +41,7 @@ def main(
     reset_db: bool = typer.Option(
         False, "--reset-db", help="Drop and recreate the inventory DB and processed registry"
     ),
-    llm: str | None = typer.Option(None, "--llm", help="LLM backend: grok | stub | auto"),
+    model: str | None = typer.Option(None, "--model", help="Grok model name (default: grok-3)"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show internal logs"),
 ) -> None:
     """Multi-agent invoice processing: ingestion -> validation -> approval -> payment."""
@@ -49,7 +49,7 @@ def main(
         level=logging.INFO if verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
     )
-    settings = Settings(llm_backend=llm) if llm else Settings()
+    settings = Settings(grok_model=model) if model else Settings()
     db = Database(settings.db_path)
 
     if init_db or reset_db:
@@ -72,13 +72,15 @@ def main(
         console.print("Nothing to do: pass [bold]--invoice_path FILE[/bold] or [bold]--all[/bold].")
         raise typer.Exit(1)
 
+    from .llm import MissingApiKeyError
     from .pipeline import Pipeline  # deferred: importing langchain is slow
 
-    pipeline = Pipeline(settings)
-    console.print(
-        f"[dim]LLM backend:[/dim] [bold]{pipeline.backend}[/bold]"
-        + (" [dim](set XAI_API_KEY to use Grok)[/dim]" if pipeline.backend == "stub" else "")
-    )
+    try:
+        pipeline = Pipeline(settings)
+    except MissingApiKeyError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from None
+    console.print(f"[dim]Reasoning engine:[/dim] [bold]{pipeline.backend}[/bold]")
 
     if process_all:
         paths = sorted(

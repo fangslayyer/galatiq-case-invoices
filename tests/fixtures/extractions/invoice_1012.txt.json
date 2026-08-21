@@ -1,0 +1,37 @@
+{
+  "invoice_number": "INV-1012",
+  "vendor": "QuickShip Distributers",
+  "invoice_date": "2026-01-26",
+  "due_date": "2026-02-25",
+  "due_date_raw": null,
+  "line_items": [
+    {
+      "item": "WidgetA",
+      "quantity": 12,
+      "unit_price": 250.0,
+      "line_total": 3000.0,
+      "note": null
+    },
+    {
+      "item": "WidgetB",
+      "quantity": 7,
+      "unit_price": 500.0,
+      "line_total": 3500.0,
+      "note": null
+    },
+    {
+      "item": "GadgetX",
+      "quantity": 4,
+      "unit_price": 750.0,
+      "line_total": 3000.0,
+      "note": null
+    }
+  ],
+  "subtotal": 9500.0,
+  "tax_amount": 475.0,
+  "extra_charges": 0.0,
+  "total": 9975.0,
+  "currency": "USD",
+  "payment_terms": "Net 30",
+  "notes": "Ref PO-20260115. Deliver to"
+}

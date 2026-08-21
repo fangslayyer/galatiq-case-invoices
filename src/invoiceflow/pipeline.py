@@ -8,6 +8,8 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+from langchain_core.language_models import BaseChatModel
+
 from .config import Settings
 from .db import Database
 from .graph import build_graph
@@ -18,15 +20,16 @@ log = logging.getLogger(__name__)
 
 
 class Pipeline:
-    def __init__(self, settings: Settings | None = None):
+    def __init__(self, settings: Settings | None = None, llm: BaseChatModel | None = None):
+        """`llm` lets tests inject a fake brain; production always uses Grok."""
         self.settings = settings or Settings()
         self.db = Database(self.settings.db_path)
-        self.llm = build_llm(self.settings)
+        self.llm = llm if llm is not None else build_llm(self.settings)
         self.graph = build_graph(self.settings, self.db, self.llm)
 
     @property
     def backend(self) -> str:
-        return self.settings.resolve_backend()
+        return getattr(self.llm, "model_name", None) or type(self.llm).__name__
 
     def run(self, invoice_path: Path | str, *, persist: bool = True) -> InvoiceRunResult:
         invoice_path = Path(invoice_path)

@@ -1,5 +1,9 @@
-"""End-to-end acceptance tests: every provided fixture through the full
-LangGraph pipeline with the deterministic stub brain.
+"""End-to-end acceptance tests: every provided sample file through the full
+LangGraph pipeline, with extraction answered from recorded ground truth
+(tests/fixtures/extractions) via FakeBrain — everything downstream of the
+LLM (validation tools, rules, reflection loop, routing, registry, payment)
+runs for real. Extraction itself is verified against live Grok in
+test_live_grok.py.
 
 The expected statuses are the case's acceptance table. `fresh` expectations
 assume an empty processed-invoice registry.
@@ -8,7 +12,6 @@ assume an empty processed-invoice registry.
 import pytest
 
 from invoiceflow.graph import build_graph
-from invoiceflow.llm import StubChatModel
 from invoiceflow.models import (
     ApprovalDecision,
     ApprovalStatus,
@@ -19,6 +22,7 @@ from invoiceflow.models import (
     IssueCode,
 )
 from tests.conftest import INVOICES_DIR
+from tests.fakes import FakeBrain
 
 ACCEPTANCE = [
     # (file, expected status on a fresh registry, expected issue codes subset)
@@ -101,7 +105,7 @@ class TestResultPersistence:
         assert result.error
 
 
-class RogueApprover(StubChatModel):
+class RogueApprover(FakeBrain):
     """A brain that approves everything and waves its own decision through —
     used to prove the graph's hard-rule guard is independent of the agents."""
 
@@ -119,8 +123,8 @@ class RogueApprover(StubChatModel):
         return super().with_structured_output(schema, **kwargs)
 
 
-def test_hard_rules_outrank_a_rogue_approver(settings, db):
-    graph = build_graph(settings, db, RogueApprover())
+def test_hard_rules_outrank_a_rogue_approver(settings, db, ground_truth):
+    graph = build_graph(settings, db, RogueApprover(extractions=ground_truth))
     state = graph.invoke(
         {
             "source_file": str(INVOICES_DIR / "invoice_1003.txt"),  # fraud: zero-stock item
@@ -135,7 +139,7 @@ def test_hard_rules_outrank_a_rogue_approver(settings, db):
     assert "payment" not in state
 
 
-class AmnesiacExtractor(StubChatModel):
+class AmnesiacExtractor(FakeBrain):
     """Fails extraction once, then succeeds — exercises the self-correction loop."""
 
     def __init__(self, **kwargs):
@@ -158,8 +162,8 @@ class AmnesiacExtractor(StubChatModel):
         return super().with_structured_output(schema, **kwargs)
 
 
-def test_extractor_self_correction_recovers(settings, db):
-    graph = build_graph(settings, db, AmnesiacExtractor())
+def test_extractor_self_correction_recovers(settings, db, ground_truth):
+    graph = build_graph(settings, db, AmnesiacExtractor(extractions=ground_truth))
     state = graph.invoke(
         {
             "source_file": str(INVOICES_DIR / "invoice_1001.txt"),

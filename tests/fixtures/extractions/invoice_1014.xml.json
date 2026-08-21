@@ -1,0 +1,30 @@
+{
+  "invoice_number": "INV-1014",
+  "vendor": "TechParts International",
+  "invoice_date": "2026-01-26",
+  "due_date": "2026-02-26",
+  "due_date_raw": null,
+  "line_items": [
+    {
+      "item": "WidgetA",
+      "quantity": 4,
+      "unit_price": 225.0,
+      "line_total": null,
+      "note": null
+    },
+    {
+      "item": "WidgetB",
+      "quantity": 6,
+      "unit_price": 475.0,
+      "line_total": null,
+      "note": null
+    }
+  ],
+  "subtotal": 3750.0,
+  "tax_amount": 375.0,
+  "extra_charges": 0.0,
+  "total": 4125.0,
+  "currency": "EUR",
+  "payment_terms": "Net 30",
+  "notes": ""
+}

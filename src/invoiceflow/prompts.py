@@ -1,8 +1,8 @@
 """Prompt construction helpers.
 
-Structured context is embedded in tagged blocks. The real LLM reads them as
-clearly-delimited context; the offline stub backend parses the same blocks
-deterministically — one prompt format, two brains.
+Structured context is embedded in tagged blocks so every agent prompt has
+clearly-delimited, machine-checkable sections (the test fakes also key off
+them to answer deterministically).
 """
 
 from __future__ import annotations

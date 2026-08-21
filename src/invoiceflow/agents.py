@@ -1,8 +1,8 @@
 """The four LLM agents: Extractor, Validator, Approver, Critic.
 
-Each agent is a plain function over a BaseChatModel so the same code runs
-against real Grok or the offline stub. All outputs are schema-bound; the
-Validator's tool loop is hand-rolled so every step is visible and testable.
+Each agent is a plain function over a BaseChatModel (Grok in production, a
+fake in tests). All outputs are schema-bound; the Validator's tool loop is
+hand-rolled so every step is visible and testable.
 """
 
 from __future__ import annotations

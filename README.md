@@ -13,20 +13,17 @@ duplicate submissions, and data that simply doesn't add up.
 
 ```bash
 uv sync                                                    # install (Python 3.12)
+cp .env.example .env                                       # put your XAI_API_KEY in it
 uv run python main.py --init-db                            # create + seed inventory.db
 uv run python main.py --invoice_path=data/invoices/invoice_1001.txt
 uv run python main.py --all                                # batch: all 20 sample files
 uv run streamlit run ui/app.py                             # review dashboard
 ```
 
-Works out of the box with **no API key**: without `XAI_API_KEY` the pipeline
-runs on a deterministic offline brain (`stub`) that exercises the exact same
-agent code paths. To use real Grok reasoning:
-
-```bash
-cp .env.example .env       # put your XAI_API_KEY in it   (or: export XAI_API_KEY=...)
-uv run python main.py --all --llm grok
-```
+Grok is the pipeline's only brain — there is deliberately no rule-based
+fallback parser. "Offline" in the brief means the *surrounding* systems
+(inventory DB, banking API) are simulated locally, not that the LLM is
+optional. The test suite, however, runs entirely without a key (see Testing).
 
 ## The multi-agent system
 
@@ -68,11 +65,14 @@ graph TD
 
 ### Design decisions
 
-- **Deterministic where possible, LLM where valuable.** Stock aggregation,
+- **The LLM is the only parser.** All document understanding — typos, OCR
+  artifacts, five file formats, weird layouts — is Grok's job via structured
+  output. A regex/heuristic fallback would be brittle in exactly the ways
+  this exercise is about, so none exists.
+- **Deterministic where the answer is checkable.** Stock aggregation,
   arithmetic verification, duplicate detection, and hard approval rules are
-  plain, unit-tested Python. The LLM does what code can't: extract structure
-  from garbage text, reason about fraud signals, and write rationale a
-  finance stakeholder can act on.
+  plain, unit-tested Python exposed to the agents as tools. The LLM decides
+  and interprets; the tools do the math.
 - **Hard rules outrank both agents.** Even if the Approver *and* Critic wave
   through an invoice with critical failures, the graph overrides them
   (proven by a `RogueApprover` test).
@@ -83,9 +83,10 @@ graph TD
 - **Idempotency built in.** A processed-invoice registry fingerprints each
   invoice by canonical content, so the same invoice arriving twice — even as
   TXT once and PDF once — is caught as a duplicate and never double-paid.
-- **One code path, two brains.** The offline stub is a real
-  `BaseChatModel`, so tests and demos execute the same tool loops and
-  structured-output calls as production Grok.
+- **Testable without pretending.** Tests inject a fake `BaseChatModel` that
+  replays *recorded ground-truth extractions* (fixtures, not a parser), so
+  the full graph — tool loops, reflection, routing, registry, payment — runs
+  offline, while extraction correctness itself is asserted against live Grok.
 
 ## What it catches (the 16 sample invoices)
 
@@ -108,16 +109,20 @@ graph TD
 ## Testing & quality
 
 ```bash
-uv run pytest                      # 80 offline tests, ~3s, no API key needed
+uv run pytest                      # 61 offline tests, ~3s, no API key needed
 uv run pytest --cov=invoiceflow    # with coverage
-uv run pytest -m live              # smoke tests against real Grok (needs XAI_API_KEY)
+uv run pytest -m live              # against real Grok (needs XAI_API_KEY)
 uv run ruff check && uv run ruff format --check
 ```
 
-The e2e suite runs every sample file through the full LangGraph pipeline and
-asserts the acceptance table above, plus registry-ordering scenarios
-(revision-after-payment, cross-format duplicates) and both self-correction
-loops (a flaky extractor that recovers, a rogue approver that gets overridden).
+The offline e2e suite runs every sample file through the full LangGraph
+pipeline and asserts the acceptance table above, plus registry-ordering
+scenarios (revision-after-payment, cross-format duplicates) and both
+self-correction loops (a flaky extractor that recovers, a rogue approver
+that gets overridden). Extraction is answered from recorded ground-truth
+fixtures (`tests/fixtures/extractions/`) — the documented contract of what
+the LLM should produce per document — while the live suite verifies real
+Grok honors that contract, including the OCR-mangled and corrupt files.
 
 ## Project layout
 
@@ -128,14 +133,13 @@ src/invoiceflow/
   agents.py              Extractor / Validator / Approver / Critic prompts & loops
   validation.py          deterministic validation tools (the Validator's toolbox)
   rules.py               hard business rules constraining the Approver
-  offline.py             deterministic extraction twin (offline/stub brain)
-  llm.py                 Grok factory + drop-in offline stub model
+  llm.py                 Grok factory (the only reasoning engine)
   models.py              Pydantic schemas for every agent's structured output
   db.py                  SQLite inventory + processed-invoice registry
   pipeline.py            run wrapper: run IDs, timing, persisted JSON results
   cli.py                 rich terminal UI: per-stage trace, batch summary
 ui/app.py                Streamlit dashboard: runs browser + escalation queue
-tests/                   82 tests (80 offline + 2 live-marked)
+tests/                   65 tests (61 offline + 4 live-marked)
 data/invoices/           provided sample invoices (the acceptance dataset)
 ```
 

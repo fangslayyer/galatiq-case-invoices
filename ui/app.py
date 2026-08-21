@@ -60,14 +60,17 @@ def resolve(result: InvoiceRunResult, approve: bool, reviewer_note: str) -> None
     else:
         result.final_status = FinalStatus.REJECTED
     verdict = "approved and paid" if approve else "rejected"
-    result.decision.reasoning += (
-        f"\n\nHuman override at {stamp}: {verdict}."
-        + (f" Note: {reviewer_note}" if reviewer_note else "")
+    result.decision.reasoning += f"\n\nHuman override at {stamp}: {verdict}." + (
+        f" Note: {reviewer_note}" if reviewer_note else ""
     )
     inv = result.invoice
     db.record_processed(
-        inv.invoice_number, inv.content_hash(), inv.vendor, inv.total,
-        result.final_status.value, result.run_id,
+        inv.invoice_number,
+        inv.content_hash(),
+        inv.vendor,
+        inv.total,
+        result.final_status.value,
+        result.run_id,
     )
     save(result)
 

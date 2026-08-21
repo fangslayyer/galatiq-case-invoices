@@ -1,0 +1,30 @@
+{
+  "invoice_number": "INV-1006",
+  "vendor": "Acme Industrial Supplies",
+  "invoice_date": "2026-01-25",
+  "due_date": "2026-02-10",
+  "due_date_raw": null,
+  "line_items": [
+    {
+      "item": "WidgetA",
+      "quantity": 5,
+      "unit_price": 250.0,
+      "line_total": null,
+      "note": null
+    },
+    {
+      "item": "WidgetB",
+      "quantity": 3,
+      "unit_price": 500.0,
+      "line_total": null,
+      "note": null
+    }
+  ],
+  "subtotal": 2750.0,
+  "tax_amount": 0.0,
+  "extra_charges": 0.0,
+  "total": 2750.0,
+  "currency": "USD",
+  "payment_terms": "Net 15",
+  "notes": ""
+}

@@ -1,10 +1,12 @@
-"""Smoke tests against the real xAI Grok API.
+"""Tests against the real xAI Grok API — extraction correctness lives here,
+since the LLM is the only parser in the system.
 
 Deselected by default (`addopts = -m 'not live'`). Run with:
-    XAI_API_KEY=... uv run pytest -m live --no-header
-"""
+    uv run pytest -m live --no-header
 
-import os
+The key is read the same way the app reads it: XAI_API_KEY from the environment
+or from .env.
+"""
 
 import pytest
 
@@ -15,7 +17,7 @@ from tests.conftest import INVOICES_DIR
 
 pytestmark = [
     pytest.mark.live,
-    pytest.mark.skipif(not os.environ.get("XAI_API_KEY"), reason="XAI_API_KEY not set"),
+    pytest.mark.skipif(not Settings().resolve_api_key(), reason="XAI_API_KEY not set"),
 ]
 
 
@@ -23,9 +25,7 @@ pytestmark = [
 def grok_pipeline(tmp_path):
     from invoiceflow.pipeline import Pipeline
 
-    settings = Settings(
-        llm_backend="grok", db_path=tmp_path / "inventory.db", results_dir=tmp_path / "results"
-    )
+    settings = Settings(db_path=tmp_path / "inventory.db", results_dir=tmp_path / "results")
     Database(settings.db_path).init()
     return Pipeline(settings)
 
@@ -42,3 +42,22 @@ def test_messy_overstock_invoice_is_not_paid(grok_pipeline):
     assert result.final_status in (FinalStatus.REJECTED, FinalStatus.NEEDS_REVIEW)
     assert result.payment is None
     assert result.invoice.invoice_number == "INV-1002"
+
+
+def test_ocr_artifacts_are_understood(grok_pipeline):
+    """invoice_1012 has 'INV 1012', '2O26', '$3,500.O0', 'Widget A' spacing —
+    exactly the messiness the LLM must normalize into structured data."""
+    result = grok_pipeline.run(INVOICES_DIR / "invoice_1012.txt", persist=False)
+    inv = result.invoice
+    assert inv.invoice_number == "INV-1012"
+    assert {li.item for li in inv.line_items} == {"WidgetA", "WidgetB", "GadgetX"}
+    assert inv.total == 9975.0
+    assert result.final_status == FinalStatus.PAID
+
+
+def test_corrupt_invoice_is_rejected(grok_pipeline):
+    result = grok_pipeline.run(INVOICES_DIR / "invoice_1009.json", persist=False)
+    assert result.final_status == FinalStatus.REJECTED
+    assert result.payment is None
+    # negative quantity must be preserved as evidence, not "fixed" by the LLM
+    assert any(li.quantity < 0 for li in result.invoice.line_items)
