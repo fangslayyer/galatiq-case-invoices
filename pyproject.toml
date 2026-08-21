@@ -1,0 +1,49 @@
+[project]
+name = "invoiceflow"
+version = "0.1.0"
+description = "Multi-agent invoice processing pipeline (Galatiq case): ingestion, validation, approval, payment"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "langchain>=1.3.16",
+    "langchain-xai>=1.3.0",
+    "langgraph>=1.2.11",
+    "pdfplumber>=0.11.10",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.15.0",
+    "rich>=15.0.0",
+    "streamlit>=1.62.0",
+    "typer>=0.27.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.16.4",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/invoiceflow"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live: tests that call the real xAI API (require XAI_API_KEY); deselected by default",
+]
+addopts = "-m 'not live'"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# typer's Option-in-default is the framework's own idiom
+"src/invoiceflow/cli.py" = ["B008"]

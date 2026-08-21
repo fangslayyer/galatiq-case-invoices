@@ -1,0 +1,148 @@
+"""Unit tests for the deterministic validation tools."""
+
+from datetime import date
+
+from invoiceflow.models import Invoice, IssueCode, LineItem, Severity
+from invoiceflow.validation import (
+    ValidationContext,
+    check_duplicate,
+    check_integrity,
+    check_inventory,
+    verify_arithmetic,
+)
+
+
+def make_invoice(**overrides) -> Invoice:
+    base = {
+        "invoice_number": "INV-9999",
+        "vendor": "Test Vendor",
+        "invoice_date": date(2026, 1, 1),
+        "due_date": date(2026, 2, 1),
+        "line_items": [LineItem(item="WidgetA", quantity=2, unit_price=250.0)],
+        "subtotal": 500.0,
+        "tax_amount": 0.0,
+        "total": 500.0,
+    }
+    base.update(overrides)
+    return Invoice(**base)
+
+
+def codes(ctx: ValidationContext) -> set[IssueCode]:
+    return {i.code for i in ctx.issues}
+
+
+class TestInventory:
+    def test_clean_invoice_passes(self, db):
+        ctx = ValidationContext(make_invoice(), db)
+        check_inventory(ctx)
+        assert ctx.issues == []
+
+    def test_unknown_item(self, db):
+        inv = make_invoice(line_items=[LineItem(item="WidgetZ", quantity=1, unit_price=1.0)])
+        ctx = ValidationContext(inv, db)
+        check_inventory(ctx)
+        assert codes(ctx) == {IssueCode.UNKNOWN_ITEM}
+
+    def test_zero_stock_is_critical(self, db):
+        inv = make_invoice(line_items=[LineItem(item="FakeItem", quantity=1, unit_price=1.0)])
+        ctx = ValidationContext(inv, db)
+        check_inventory(ctx)
+        assert ctx.issues[0].code == IssueCode.OUT_OF_STOCK
+        assert ctx.issues[0].severity == Severity.CRITICAL
+
+    def test_aggregate_quantities_across_lines(self, db):
+        # 9 + 8 = 17 > 15 in stock, even though each line alone fits
+        inv = make_invoice(
+            line_items=[
+                LineItem(item="WidgetA", quantity=9, unit_price=250.0),
+                LineItem(item="WidgetA", quantity=8, unit_price=240.0),
+            ]
+        )
+        ctx = ValidationContext(inv, db)
+        check_inventory(ctx)
+        assert codes(ctx) == {IssueCode.STOCK_EXCEEDED}
+        assert "17" in ctx.issues[0].detail
+
+
+class TestArithmetic:
+    def test_correct_math_passes(self, db):
+        ctx = ValidationContext(make_invoice(), db)
+        verify_arithmetic(ctx)
+        assert ctx.issues == []
+
+    def test_line_total_mismatch(self, db):
+        inv = make_invoice(
+            line_items=[LineItem(item="WidgetA", quantity=2, unit_price=250.0, line_total=600.0)]
+        )
+        ctx = ValidationContext(inv, db)
+        verify_arithmetic(ctx)
+        assert IssueCode.LINE_TOTAL_MISMATCH in codes(ctx)
+
+    def test_total_includes_tax_and_charges(self, db):
+        inv = make_invoice(subtotal=500.0, tax_amount=25.0, extra_charges=10.0, total=535.0)
+        ctx = ValidationContext(inv, db)
+        verify_arithmetic(ctx)
+        assert ctx.issues == []
+
+    def test_total_mismatch(self, db):
+        inv = make_invoice(total=999.0)
+        ctx = ValidationContext(inv, db)
+        verify_arithmetic(ctx)
+        assert IssueCode.TOTAL_MISMATCH in codes(ctx)
+
+
+class TestIntegrity:
+    def test_clean_passes(self, db):
+        ctx = ValidationContext(make_invoice(), db)
+        check_integrity(ctx)
+        assert ctx.issues == []
+
+    def test_negative_quantity_and_missing_vendor(self, db):
+        inv = make_invoice(
+            vendor="",
+            line_items=[LineItem(item="WidgetA", quantity=-5, unit_price=250.0)],
+            total=-250.0,
+        )
+        ctx = ValidationContext(inv, db)
+        check_integrity(ctx)
+        assert {
+            IssueCode.MISSING_VENDOR,
+            IssueCode.NEGATIVE_QUANTITY,
+            IssueCode.NEGATIVE_AMOUNT,
+        } <= codes(ctx)
+
+    def test_due_date_not_after_invoice_date(self, db):
+        inv = make_invoice(due_date=date(2026, 1, 1))
+        ctx = ValidationContext(inv, db)
+        check_integrity(ctx)
+        assert IssueCode.SUSPICIOUS_DUE_DATE in codes(ctx)
+
+    def test_unexpected_currency(self, db):
+        ctx = ValidationContext(make_invoice(currency="EUR"), db)
+        check_integrity(ctx)
+        assert IssueCode.UNEXPECTED_CURRENCY in codes(ctx)
+
+
+class TestDuplicates:
+    def test_first_sighting_is_clean(self, db):
+        ctx = ValidationContext(make_invoice(), db)
+        check_duplicate(ctx)
+        assert ctx.issues == []
+
+    def test_exact_duplicate_is_critical(self, db):
+        inv = make_invoice()
+        db.record_processed(
+            inv.invoice_number, inv.content_hash(), inv.vendor, inv.total, "paid", "r1"
+        )
+        ctx = ValidationContext(inv, db)
+        check_duplicate(ctx)
+        assert ctx.issues[0].code == IssueCode.DUPLICATE_INVOICE
+        assert ctx.issues[0].severity == Severity.CRITICAL
+
+    def test_same_number_different_content_is_revision(self, db):
+        inv = make_invoice()
+        db.record_processed(inv.invoice_number, "different-hash", inv.vendor, 100.0, "paid", "r1")
+        ctx = ValidationContext(inv, db)
+        check_duplicate(ctx)
+        assert ctx.issues[0].code == IssueCode.REVISED_INVOICE
+        assert ctx.issues[0].severity == Severity.WARNING
