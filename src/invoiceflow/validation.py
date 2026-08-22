@@ -3,12 +3,15 @@
 Each check is plain, unit-testable Python. The LLM's job is to decide which
 checks to run and to interpret the combined results; it never does the math
 itself. Tools are closed over a ValidationContext (current invoice + db) so
-the model cannot hallucinate arguments.
+the model cannot hallucinate arguments. Each check is a plain function that
+adds issues to the context; @check wraps it into the tool the agent sees.
 """
 
 from __future__ import annotations
 
+import functools
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from langchain_core.tools import BaseTool, tool
@@ -33,151 +36,199 @@ class ValidationContext:
     issues: list[ValidationIssue] = field(default_factory=list)
     tools_used: list[str] = field(default_factory=list)
 
-    def add(self, code: IssueCode, severity: Severity, detail: str) -> None:
+    def add_issue(self, code: IssueCode, severity: Severity, detail: str) -> None:
         self.issues.append(ValidationIssue(code=code, severity=severity, detail=detail))
 
+    def report(self, tool_name: str, since: int) -> str:
+        """Close out a check: record that it ran, and render what it found.
 
-def _report(ctx: ValidationContext, tool_name: str, found: list[ValidationIssue]) -> str:
-    ctx.tools_used.append(tool_name)
-    if not found:
-        return f"{tool_name}: OK, no issues found."
-    lines = [f"- [{i.severity.upper()}] {i.code}: {i.detail}" for i in found]
-    return f"{tool_name}: {len(found)} issue(s) found:\n" + "\n".join(lines)
+        `since` is `len(self.issues)` captured before the check started, so
+        `issues[since:]` is exactly this tool's own findings — the checks all
+        append into one shared list.
+        """
+        self.tools_used.append(tool_name)
+        found = self.issues[since:]
+        if not found:
+            return f"{tool_name}: OK, no issues found."
+        lines = [f"- [{i.severity.upper()}] {i.code}: {i.detail}" for i in found]
+        return f"{tool_name}: {len(found)} issue(s) found:\n" + "\n".join(lines)
 
 
-def check_inventory(ctx: ValidationContext) -> str:
+Check = Callable[[ValidationContext], str]
+
+#: Every check, keyed by the name the LLM calls it by. Populated by @check.
+ALL_CHECKS: dict[str, Check] = {}
+
+
+def check(fn: Callable[[ValidationContext], None]) -> Check:
+    """Turn an issue-finding function into a registered validation tool.
+
+    The body only finds issues; this wrapper owns the bookkeeping around it —
+    the checkpoint, the report, the registry entry. All three take the name
+    from `fn.__name__`, so the registry key, the name the LLM calls, and the
+    entry in `tools_used` cannot drift apart.
+    """
+
+    @functools.wraps(fn)
+    def run(ctx: ValidationContext) -> str:
+        before = len(ctx.issues)
+        fn(ctx)
+        return ctx.report(fn.__name__, before)
+
+    ALL_CHECKS[fn.__name__] = run
+    return run
+
+
+@check
+def check_inventory(ctx: ValidationContext) -> None:
     """Verify every line item exists in inventory and the *aggregate* ordered
     quantity per item fits available stock."""
-    before = len(ctx.issues)
-    totals: dict[str, int] = defaultdict(int)
+    invoice_qty_totals: dict[str, int] = defaultdict(int)
+
     for li in ctx.invoice.line_items:
-        totals[li.item] += li.quantity
-    for item, qty in totals.items():
-        rec = ctx.db.get_item(item)
-        if rec is None:
-            ctx.add(
+        invoice_qty_totals[li.item] += li.quantity
+
+    for item, invoice_qty in invoice_qty_totals.items():
+        record = ctx.db.get_item(item)
+        if record is None:
+            ctx.add_issue(
                 IssueCode.UNKNOWN_ITEM,
                 Severity.WARNING,
                 f"'{item}' is not in the inventory database",
             )
-        elif rec.stock == 0:
-            ctx.add(
+        elif record.stock == 0:
+            ctx.add_issue(
                 IssueCode.OUT_OF_STOCK,
                 Severity.CRITICAL,
-                f"'{item}' has zero stock (ordered {qty})",
+                f"'{item}' has zero stock (ordered {invoice_qty})",
             )
-        elif qty > rec.stock:
-            ctx.add(
+        elif invoice_qty > record.stock:
+            ctx.add_issue(
                 IssueCode.STOCK_EXCEEDED,
                 Severity.CRITICAL,
-                f"'{item}' total ordered quantity {qty} exceeds available stock {rec.stock}",
+                f"'{item}' total ordered quantity {invoice_qty} exceeds available stock {record.stock}",
             )
-    return _report(ctx, "check_inventory", ctx.issues[before:])
 
 
-def verify_arithmetic(ctx: ValidationContext) -> str:
+@check
+def verify_arithmetic(ctx: ValidationContext) -> None:
     """Recompute line totals, subtotal, and grand total and compare with the
     amounts the vendor stated."""
-    before = len(ctx.issues)
-    inv = ctx.invoice
+    invoice = ctx.invoice
     computed_subtotal = 0.0
-    for li in inv.line_items:
+
+    for li in invoice.line_items:
         if li.unit_price is None:
             continue
         expected = li.quantity * li.unit_price
         computed_subtotal += expected
         if li.line_total is not None and abs(li.line_total - expected) > MONEY_TOLERANCE:
-            ctx.add(
+            ctx.add_issue(
                 IssueCode.LINE_TOTAL_MISMATCH,
                 Severity.WARNING,
                 f"'{li.item}': stated line total {li.line_total:.2f} != "
                 f"{li.quantity} x {li.unit_price:.2f} = {expected:.2f}",
             )
-    if inv.subtotal is not None and abs(inv.subtotal - computed_subtotal) > MONEY_TOLERANCE:
-        ctx.add(
+
+    if invoice.subtotal is not None and abs(invoice.subtotal - computed_subtotal) > MONEY_TOLERANCE:
+        ctx.add_issue(
             IssueCode.SUBTOTAL_MISMATCH,
             Severity.WARNING,
-            f"stated subtotal {inv.subtotal:.2f} != computed {computed_subtotal:.2f}",
+            f"stated subtotal {invoice.subtotal:.2f} != computed {computed_subtotal:.2f}",
         )
-    if inv.total is not None:
+
+    if invoice.total is not None:
         expected_total = (
-            (inv.subtotal if inv.subtotal is not None else computed_subtotal)
-            + (inv.tax_amount or 0.0)
-            + inv.extra_charges
+            (invoice.subtotal if invoice.subtotal is not None else computed_subtotal)
+            + (invoice.tax_amount or 0.0)
+            + invoice.extra_charges
         )
-        if abs(inv.total - expected_total) > MONEY_TOLERANCE:
-            ctx.add(
+        if abs(invoice.total - expected_total) > MONEY_TOLERANCE:
+            ctx.add_issue(
                 IssueCode.TOTAL_MISMATCH,
                 Severity.WARNING,
-                f"stated total {inv.total:.2f} != subtotal + tax + charges = {expected_total:.2f}",
+                f"stated total {invoice.total:.2f} != subtotal + tax + charges = {expected_total:.2f}",
             )
-    return _report(ctx, "verify_arithmetic", ctx.issues[before:])
 
 
-def check_integrity(ctx: ValidationContext) -> str:
+@check
+def check_integrity(ctx: ValidationContext) -> None:
     """Sanity-check the invoice data itself: required fields, negative values,
     suspicious dates, unexpected currency."""
-    before = len(ctx.issues)
-    inv = ctx.invoice
-    if not inv.vendor.strip():
-        ctx.add(IssueCode.MISSING_VENDOR, Severity.CRITICAL, "vendor name is missing")
-    if not inv.line_items:
-        ctx.add(IssueCode.NO_LINE_ITEMS, Severity.CRITICAL, "invoice has no line items")
-    for li in inv.line_items:
+    invoice = ctx.invoice
+
+    if not invoice.vendor.strip():
+        ctx.add_issue(IssueCode.MISSING_VENDOR, Severity.CRITICAL, "vendor name is missing")
+
+    if not invoice.line_items:
+        ctx.add_issue(IssueCode.NO_LINE_ITEMS, Severity.CRITICAL, "invoice has no line items")
+
+    for li in invoice.line_items:
         if li.quantity < 0:
-            ctx.add(
+            ctx.add_issue(
                 IssueCode.NEGATIVE_QUANTITY,
                 Severity.CRITICAL,
                 f"'{li.item}' has negative quantity {li.quantity}",
             )
-    if inv.total is not None and inv.total < 0:
-        ctx.add(
-            IssueCode.NEGATIVE_AMOUNT, Severity.CRITICAL, f"total amount is negative ({inv.total})"
+    if invoice.total is None:
+        # An absent total is a hole, not a finding: every other total check
+        # below is guarded by `is not None`, so without this the invoice would
+        # pass validation by having nothing left to check. Critical because
+        # nothing can proceed without it — what the pipeline *does* about it is
+        # the rule engine's call, not this severity's (see evaluate_rules).
+        ctx.add_issue(
+            IssueCode.MISSING_TOTAL,
+            Severity.CRITICAL,
+            "no total amount could be extracted, so the amount owed cannot be established",
         )
-    if inv.due_date is None:
+    elif invoice.total < 0:
+        ctx.add_issue(
+            IssueCode.NEGATIVE_AMOUNT, Severity.CRITICAL, f"total amount is negative ({invoice.total})"
+        )
+
+    if invoice.due_date is None:
         detail = (
-            f"due date is not a parseable date: '{inv.due_date_raw}'"
-            if inv.due_date_raw
+            f"due date is not a parseable date: '{invoice.due_date_raw}'"
+            if invoice.due_date_raw
             else "due date is missing"
         )
-        ctx.add(IssueCode.MISSING_DUE_DATE, Severity.WARNING, detail)
-    elif inv.invoice_date is not None and inv.due_date <= inv.invoice_date:
-        ctx.add(
+        ctx.add_issue(IssueCode.MISSING_DUE_DATE, Severity.WARNING, detail)
+    elif invoice.invoice_date is not None and invoice.due_date <= invoice.invoice_date:
+        ctx.add_issue(
             IssueCode.SUSPICIOUS_DUE_DATE,
             Severity.WARNING,
-            f"due date {inv.due_date} is not after invoice date {inv.invoice_date}",
+            f"due date {invoice.due_date} is not after invoice date {invoice.invoice_date}",
         )
-    if inv.currency.upper() != ctx.expected_currency.upper():
-        ctx.add(
+
+    if invoice.currency.upper() != ctx.expected_currency.upper():
+        ctx.add_issue(
             IssueCode.UNEXPECTED_CURRENCY,
             Severity.WARNING,
-            f"invoice currency is {inv.currency}, expected {ctx.expected_currency}",
+            f"invoice currency is {invoice.currency}, expected {ctx.expected_currency}",
         )
-    return _report(ctx, "check_integrity", ctx.issues[before:])
 
 
-def check_duplicate(ctx: ValidationContext) -> str:
+@check
+def check_duplicate(ctx: ValidationContext) -> None:
     """Compare against the processed-invoice registry: exact duplicates must
     never be paid twice; same-number-different-content means a revision."""
-    before = len(ctx.issues)
     inv = ctx.invoice
     prior = ctx.db.get_processed(inv.invoice_number)
     if prior is not None:
         if prior.content_hash == inv.content_hash():
-            ctx.add(
+            ctx.add_issue(
                 IssueCode.DUPLICATE_INVOICE,
                 Severity.CRITICAL,
                 f"{inv.invoice_number} was already processed "
                 f"(status: {prior.final_status}) with identical content",
             )
         else:
-            ctx.add(
+            ctx.add_issue(
                 IssueCode.REVISED_INVOICE,
                 Severity.WARNING,
                 f"{inv.invoice_number} was already processed (status: {prior.final_status}) "
                 "but the content differs — this looks like a revised invoice",
             )
-    return _report(ctx, "check_duplicate", ctx.issues[before:])
 
 
 def forged_fence_issue(raw_text: str) -> ValidationIssue | None:
@@ -188,10 +239,10 @@ def forged_fence_issue(raw_text: str) -> ValidationIssue | None:
     is the real defense; `check_prompt_safety` below is the backstop for any
     path that reaches the validator without passing it.
     """
-    forged = Tag.scan(raw_text)
-    if not forged:
+    forged_tags = Tag.scan(raw_text)
+    if not forged_tags:
         return None
-    labels = ", ".join(sorted(f"<{tag}>" for tag in forged))
+    labels = ", ".join(sorted(f"<{tag}>" for tag in forged_tags))
     return ValidationIssue(
         code=IssueCode.PROMPT_INJECTION_ATTEMPT,
         severity=Severity.WARNING,
@@ -200,29 +251,19 @@ def forged_fence_issue(raw_text: str) -> ValidationIssue | None:
     )
 
 
-def check_prompt_safety(ctx: ValidationContext) -> str:
+@check
+def check_prompt_safety(ctx: ValidationContext) -> None:
     """Detect a prompt-injection attempt: fence labels this pipeline uses,
     forged inside the vendor-supplied document text."""
-    before = len(ctx.issues)
     issue = forged_fence_issue(ctx.raw_text)
     if issue is not None:
         ctx.issues.append(issue)
-    return _report(ctx, "check_prompt_safety", ctx.issues[before:])
-
-
-ALL_CHECKS = {
-    "check_inventory": check_inventory,
-    "verify_arithmetic": verify_arithmetic,
-    "check_integrity": check_integrity,
-    "check_duplicate": check_duplicate,
-    "check_prompt_safety": check_prompt_safety,
-}
 
 
 def build_tools(ctx: ValidationContext) -> list[BaseTool]:
     """Wrap the checks as no-argument LangChain tools bound to this context."""
 
-    def make(name: str, fn) -> BaseTool:
+    def make(name: str, fn: Check) -> BaseTool:
         @tool(name, description=fn.__doc__ or name)
         def _run() -> str:
             return fn(ctx)
