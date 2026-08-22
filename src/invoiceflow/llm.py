@@ -1,9 +1,8 @@
 """LLM factory: xAI Grok is the single reasoning engine.
 
-There is deliberately no rule-based fallback parser here — understanding
-messy invoice documents is the LLM's job. "Offline" in the case brief means
-no external non-Grok APIs (payment and inventory are mocked locally), not a
-hand-rolled backup brain. Tests inject a fake chat model instead.
+"Offline" in the case brief means no external non-Grok APIs (payment
+and inventory are mocked locally), not a hand-rolled backup brain. Tests
+inject a fake chat model instead.
 """
 
 from __future__ import annotations

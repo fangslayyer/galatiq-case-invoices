@@ -55,6 +55,12 @@ graph TD
     S -- human override --> G
 ```
 
+That diagram is the conceptual flow. The graph LangGraph *actually* compiles is
+exported on every `build_graph()` call, so the picture can never drift from the
+code — mermaid source alongside it in [docs/graph.mmd](docs/graph.mmd):
+
+<img src="docs/graph.png" alt="Compiled LangGraph topology" width="200">
+
 | Agent | Role | Agentic pattern |
 |---|---|---|
 | **Extractor** | Messy text → structured `Invoice` (canonical item names, OCR fixes) | Self-correction loop #1: schema/sanity errors fed back, ≤2 retries |
@@ -124,6 +130,29 @@ fixtures (`tests/fixtures/extractions/`) — the documented contract of what
 the LLM should produce per document — while the live suite verifies real
 Grok honors that contract, including the OCR-mangled and corrupt files.
 
+### Tracing runs (development only)
+
+Every agent call, tool loop and critique round can be streamed to
+[LangSmith](https://smith.langchain.com) for inspection — the trace tree shows
+each self-correction retry's *actual* prompt and where the tokens went, which
+the flat per-stage trace in the terminal deliberately flattens away.
+
+It is **off by default and meant for development only**: enabling it sends
+prompts and invoice contents to LangSmith's cloud, which is exactly what "no
+external APIs beyond Grok" rules out for anything resembling real invoice data.
+Uncomment the LangSmith block in `.env` (or export the same variables) to turn
+it on for a debugging session:
+
+```bash
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=lsv2_...
+LANGSMITH_PROJECT=invoiceflow
+```
+
+Runs are named per invoice and tagged with the model, the CLI prints a banner
+whenever tracing is live, and the test suite forces it off
+(`tests/__init__.py`) so 61 fake-brain runs never land in a real project.
+
 ## Project layout
 
 ```
@@ -141,6 +170,7 @@ src/invoiceflow/
 ui/app.py                Streamlit dashboard: runs browser + escalation queue
 tests/                   65 tests (61 offline + 4 live-marked)
 data/invoices/           provided sample invoices (the acceptance dataset)
+docs/graph.png|.mmd      compiled LangGraph topology, re-exported by build_graph()
 ```
 
 ## Business impact

@@ -10,7 +10,7 @@ from pathlib import Path
 
 from langchain_core.language_models import BaseChatModel
 
-from .config import Settings
+from .config import Settings, langsmith_project
 from .db import Database
 from .graph import build_graph
 from .llm import build_llm
@@ -26,6 +26,9 @@ class Pipeline:
         self.db = Database(self.settings.db_path)
         self.llm = llm if llm is not None else build_llm(self.settings)
         self.graph = build_graph(self.settings, self.db, self.llm)
+        project = langsmith_project()
+        if project:
+            log.info("LangSmith tracing enabled — runs stream to project %r", project)
 
     @property
     def backend(self) -> str:
@@ -44,7 +47,17 @@ class Pipeline:
                 "started_at": started,
                 "trace": [],
                 "critique_rounds": [],
-            }
+            },
+            # Names and labels the trace tree when LangSmith is on; inert otherwise.
+            config={
+                "run_name": f"invoice {invoice_path.name}",
+                "tags": ["invoiceflow", self.backend],
+                "metadata": {
+                    "run_id": run_id,
+                    "source_file": str(invoice_path),
+                    "llm_backend": self.backend,
+                },
+            },
         )
         result = InvoiceRunResult(
             run_id=run_id,

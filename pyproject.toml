@@ -11,6 +11,7 @@ dependencies = [
     "pdfplumber>=0.11.10",
     "pydantic>=2.13.4",
     "pydantic-settings>=2.15.0",
+    "python-dotenv>=1.2.3",
     "rich>=15.0.0",
     "streamlit>=1.62.0",
     "typer>=0.27.1",
@@ -18,6 +19,8 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "ipykernel>=7.3.0",
+    "jupyterlab>=4.6.3",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
     "ruff>=0.16.4",
@@ -47,3 +50,5 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 [tool.ruff.lint.per-file-ignores]
 # typer's Option-in-default is the framework's own idiom
 "src/invoiceflow/cli.py" = ["B008"]
+
+[tool.ruff] exclude = ["docs"]

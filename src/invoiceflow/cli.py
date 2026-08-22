@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from .config import PROJECT_ROOT, Settings
+from .config import PROJECT_ROOT, Settings, langsmith_project
 from .db import Database
 from .loaders import SUPPORTED_EXTENSIONS
 from .models import FinalStatus, InvoiceRunResult, Severity
@@ -41,7 +41,7 @@ def main(
     reset_db: bool = typer.Option(
         False, "--reset-db", help="Drop and recreate the inventory DB and processed registry"
     ),
-    model: str | None = typer.Option(None, "--model", help="Grok model name (default: grok-3)"),
+    model: str | None = typer.Option(None, "--model", help="Grok model name (default: grok-4.6)"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show internal logs"),
 ) -> None:
     """Multi-agent invoice processing: ingestion -> validation -> approval -> payment."""
@@ -81,6 +81,11 @@ def main(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from None
     console.print(f"[dim]Reasoning engine:[/dim] [bold]{pipeline.backend}[/bold]")
+    if project := langsmith_project():
+        console.print(
+            f"[dim]LangSmith tracing:[/dim] [bold]{project}[/bold] "
+            "[dim](development only — prompts and invoice text leave the machine)[/dim]"
+        )
 
     if process_all:
         paths = sorted(

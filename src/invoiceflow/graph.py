@@ -11,12 +11,13 @@ agent's structured output, which keeps the flow inspectable and testable.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from langchain_core.language_models import BaseChatModel
 from langgraph.graph import END, StateGraph
 
 from .agents import ExtractionError, run_approver, run_critic, run_extractor, run_validator
-from .config import Settings
+from .config import PROJECT_ROOT, Settings
 from .db import Database
 from .loaders import load_invoice_text
 from .models import (
@@ -34,6 +35,8 @@ from .state import PipelineState
 from .validation import ValidationContext
 
 log = logging.getLogger(__name__)
+
+DOCS_DIR = PROJECT_ROOT / "docs"
 
 
 def _ev(stage: str, event: str, detail: str = "") -> TraceEvent:
@@ -229,7 +232,30 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
     graph.add_conditional_edges("critique", after_critique, ["approve", "pay", "record"])
     graph.add_edge("pay", "record")
     graph.add_edge("record", END)
-    return graph.compile()
+    compiled = graph.compile()
+    export_graph_image(compiled)
+    return compiled
+
+
+def export_graph_image(compiled, out_dir: Path = DOCS_DIR) -> None:
+    """Render the compiled graph to docs/graph.png (mermaid source alongside it).
+
+    The PNG is rendered by mermaid.ink, so it is only re-fetched when the graph
+    topology actually changed, and a failure (offline, service down) is logged
+    rather than raised: a missing diagram must never break a pipeline run.
+    """
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        drawable = compiled.get_graph()
+        mermaid = drawable.draw_mermaid()
+        mmd_path, png_path = out_dir / "graph.mmd", out_dir / "graph.png"
+        if png_path.exists() and mmd_path.exists() and mmd_path.read_text() == mermaid:
+            return
+        mmd_path.write_text(mermaid)
+        png_path.write_bytes(drawable.draw_mermaid_png())
+        log.info("graph diagram written to %s", png_path)
+    except Exception as exc:  # diagram export is best-effort, never fatal
+        log.warning("graph diagram export skipped: %s", exc)
 
 
 def _final_status(state: PipelineState) -> FinalStatus:
