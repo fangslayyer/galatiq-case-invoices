@@ -10,6 +10,7 @@ from invoiceflow.models import (
     Severity,
     ValidationIssue,
     ValidationReport,
+    ValidatorSummary,
 )
 from invoiceflow.prompts import Tag
 from invoiceflow.rules import evaluate_rules
@@ -114,6 +115,56 @@ class TestValidatorAgent:
         }
         assert report.issues == []
         assert report.summary
+
+
+class TestAgentIssueClamp:
+    """The Validator agent shares an issue list with the tools it calls, so the
+    schema — not the prompt — is what keeps its observations advisory."""
+
+    def test_agent_cannot_mint_a_control_flow_code(self):
+        summary = ValidatorSummary(
+            summary="looks like a repeat",
+            extra_issues=[critical(IssueCode.DUPLICATE_INVOICE, "I think I've seen this")],
+        )
+        issue = summary.extra_issues[0]
+        assert issue.code == IssueCode.AGENT_OBSERVATION
+        assert issue.severity == Severity.WARNING
+        # The detail survives: demoted, not silenced.
+        assert issue.detail == "I think I've seen this"
+
+    def test_agent_cannot_force_a_hard_rejection(self):
+        summary = ValidatorSummary(
+            summary="this invoice is fraudulent",
+            extra_issues=[critical(IssueCode.NEGATIVE_AMOUNT, "the total smells wrong")],
+        )
+        report = make_report(*summary.extra_issues)
+        c = evaluate_rules(make_invoice(), report, 10_000)
+        assert not c.must_reject
+        assert c.advisory_warnings
+
+    def test_agent_issues_do_not_route_to_duplicate(self):
+        summary = ValidatorSummary(
+            summary="repeat",
+            extra_issues=[critical(IssueCode.DUPLICATE_INVOICE, "seen before")],
+        )
+        assert not make_report(*summary.extra_issues).is_exact_duplicate
+
+    def test_info_observations_pass_through_unchanged(self):
+        note = ValidationIssue(
+            code=IssueCode.AGENT_OBSERVATION, severity=Severity.INFO, detail="net-30 terms"
+        )
+        summary = ValidatorSummary(summary="fine", extra_issues=[note])
+        assert summary.extra_issues[0] == note
+
+    def test_tool_issue_still_routes_to_duplicate(self):
+        # The clamp constrains the agent only — the check_duplicate tool's own
+        # issue must keep its authority over the graph.
+        report = make_report(critical(IssueCode.DUPLICATE_INVOICE, "already processed"))
+        assert report.is_exact_duplicate
+
+    def test_revision_is_not_a_duplicate(self):
+        report = make_report(warning(IssueCode.REVISED_INVOICE, "content differs"))
+        assert not report.is_exact_duplicate
 
 
 class TestPromptTags:

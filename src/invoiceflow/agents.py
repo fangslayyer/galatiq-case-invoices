@@ -157,6 +157,9 @@ def run_validator(llm: BaseChatModel, ctx: ValidationContext) -> ValidationRepor
         ],
     )
     return ValidationReport(
+        # Tool issues carry authority, agent issues do not: `ValidatorSummary`
+        # has already demoted every extra_issue to an advisory observation, so
+        # merging the two lists cannot hand the model control of the graph.
         issues=[*ctx.issues, *summary.extra_issues],
         summary=summary.summary,
         tools_used=ctx.tools_used,

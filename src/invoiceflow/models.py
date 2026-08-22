@@ -10,7 +10,7 @@ import hashlib
 from datetime import date
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class Severity(StrEnum):
@@ -118,7 +118,17 @@ class ValidationIssue(BaseModel):
 
 
 class ValidatorSummary(BaseModel):
-    """The Validator agent's own read of the tool results."""
+    """The Validator agent's own read of the tool results.
+
+    `extra_issues` is the agent's free-form observation channel, and it is
+    clamped on the way in: the model may report anything it noticed, but it may
+    not mint the codes and severities the rest of the pipeline routes on. An
+    unclamped summary claiming `duplicate_invoice`/`critical` would send the run
+    straight to `record` as a duplicate, and *any* critical code would trip
+    `must_reject` in `evaluate_rules` — control flow authored by the text being
+    judged. Same principle as `Tag.wrap`: structure is ours, model output is
+    data.
+    """
 
     summary: str = Field(description="One-paragraph assessment of the invoice's validity")
     extra_issues: list[ValidationIssue] = Field(
@@ -126,6 +136,28 @@ class ValidatorSummary(BaseModel):
         description="Additional issues the agent noticed that no tool covers "
         "(use code 'agent_observation')",
     )
+
+    @field_validator("extra_issues")
+    @classmethod
+    def _demote_to_observations(cls, issues: list[ValidationIssue]) -> list[ValidationIssue]:
+        """Rewrite every agent-authored issue into an advisory observation.
+
+        A prompt asking for `agent_observation` is a request; this is the
+        constraint. CRITICAL is downgraded rather than dropped, so the agent's
+        concern still reaches the Approver as an advisory warning: it loses its
+        authority over the graph, not its voice.
+        """
+        return [
+            issue.model_copy(
+                update={
+                    "code": IssueCode.AGENT_OBSERVATION,
+                    "severity": (
+                        Severity.WARNING if issue.severity == Severity.CRITICAL else issue.severity
+                    ),
+                }
+            )
+            for issue in issues
+        ]
 
 
 class ValidationReport(BaseModel):
@@ -143,6 +175,20 @@ class ValidationReport(BaseModel):
 
     def issues_at(self, severity: Severity) -> list[ValidationIssue]:
         return [i for i in self.issues if i.severity == severity]
+
+    @property
+    def is_exact_duplicate(self) -> bool:
+        """True when the registry already holds this invoice byte-for-byte.
+
+        The one issue code that steers the graph by itself: an exact duplicate
+        skips approval entirely and is recorded unpaid. The code alone is a
+        sufficient test because `check_duplicate` is its only author — it raises
+        `REVISED_INVOICE` for a same-number-different-content match, and
+        `ValidatorSummary` demotes every agent-authored issue to
+        `AGENT_OBSERVATION`. Kept here rather than spelled out at each routing
+        site so the two cannot drift apart.
+        """
+        return any(i.code == IssueCode.DUPLICATE_INVOICE for i in self.issues)
 
 
 # ---------------------------------------------------------------------------

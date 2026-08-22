@@ -25,8 +25,6 @@ from .models import (
     CritiqueRound,
     CritiqueVerdict,
     FinalStatus,
-    IssueCode,
-    Severity,
     TraceEvent,
     ValidationReport,
 )
@@ -237,12 +235,7 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
         return "validate"
 
     def after_validate(state: PipelineState) -> str:
-        report = state["report"]
-        is_exact_duplicate = any(
-            i.code == IssueCode.DUPLICATE_INVOICE and i.severity == Severity.CRITICAL
-            for i in report.issues
-        )
-        return "record" if is_exact_duplicate else "approve"
+        return "record" if state["report"].is_exact_duplicate else "approve"
 
     def after_critique(state: PipelineState) -> str:
         rounds = state["critique_rounds"]
@@ -301,10 +294,7 @@ def _final_status(state: PipelineState) -> FinalStatus:
         # an artifact is the one judgement no agent here is fit to make.
         return FinalStatus.NEEDS_REVIEW
     report = state.get("report")
-    if report is not None and any(
-        i.code == IssueCode.DUPLICATE_INVOICE and i.severity == Severity.CRITICAL
-        for i in report.issues
-    ):
+    if report is not None and report.is_exact_duplicate:
         return FinalStatus.DUPLICATE
     payment = state.get("payment")
     if payment is not None:
