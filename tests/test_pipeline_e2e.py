@@ -109,7 +109,12 @@ class TestResultPersistence:
 
 class RogueApprover(FakeBrain):
     """A brain that approves everything and waves its own decision through —
-    used to prove the graph's hard-rule guard is independent of the agents."""
+    used to prove the graph's hard-rule guard is independent of the agents.
+
+    `critic_verdict` chooses what the Critic answers, so the guard can be held
+    against every verdict rather than only the one that happens to agree."""
+
+    critic_verdict: CritiqueVerdict = CritiqueVerdict.ACCEPT
 
     def with_structured_output(self, schema, **kwargs):
         from langchain_core.runnables import RunnableLambda
@@ -119,14 +124,18 @@ class RogueApprover(FakeBrain):
                 lambda _: ApprovalDecision(status=ApprovalStatus.APPROVED, reasoning="ship it")
             )
         if schema is Critique:
-            return RunnableLambda(
-                lambda _: Critique(verdict=CritiqueVerdict.ACCEPT, feedback="lgtm")
-            )
+            return RunnableLambda(lambda _: Critique(verdict=self.critic_verdict, feedback="lgtm"))
         return super().with_structured_output(schema, **kwargs)
 
 
-def test_hard_rules_outrank_a_rogue_approver(settings, db, ground_truth):
-    graph = build_graph(settings, db, RogueApprover(extractions=ground_truth))
+@pytest.mark.parametrize("verdict", list(CritiqueVerdict))
+def test_hard_rules_outrank_a_rogue_approver(settings, db, ground_truth, verdict):
+    """No Critic verdict can keep a must_reject invoice approved or paid: the
+    hard rule is applied before the verdict is consulted, and the edge into
+    `pay` refuses a must_reject regardless of what either agent decided."""
+    graph = build_graph(
+        settings, db, RogueApprover(extractions=ground_truth, critic_verdict=verdict)
+    )
     state = graph.invoke(
         {
             "source_file_path": str(INVOICES_DIR / "invoice_1003.txt"),  # fraud: zero-stock item
@@ -139,6 +148,40 @@ def test_hard_rules_outrank_a_rogue_approver(settings, db, ground_truth):
     assert state["decision"].status == ApprovalStatus.REJECTED
     assert state["final_status"] == FinalStatus.REJECTED
     assert "payment" not in state
+
+
+class EscalatingCritic(FakeBrain):
+    """An honest Approver behind a Critic that escalates everything — the other
+    side of the guard: a hard rejection must not be softened into human review."""
+
+    def with_structured_output(self, schema, **kwargs):
+        from langchain_core.runnables import RunnableLambda
+
+        if schema is Critique:
+            return RunnableLambda(
+                lambda _: Critique(verdict=CritiqueVerdict.ESCALATE, feedback="I am unsure")
+            )
+        return super().with_structured_output(schema, **kwargs)
+
+
+def test_escalation_cannot_soften_a_hard_rejection(settings, db, ground_truth):
+    graph = build_graph(settings, db, EscalatingCritic(extractions=ground_truth))
+    state = graph.invoke(
+        {
+            "source_file_path": str(INVOICES_DIR / "invoice_1003.txt"),  # fraud: zero-stock item
+            "run_id": "escalating-critic-test",
+            "started_at": "",
+            "trace": [],
+            "critique_rounds": [],
+        }
+    )
+    assert state["decision"].status == ApprovalStatus.REJECTED
+    assert state["final_status"] == FinalStatus.REJECTED
+    # The Approver already rejected, so its reasoning stands and the override
+    # never fires: `hard_rule_override` stays a signal that an agent went rogue.
+    assert not any(e.event == "hard_rule_override" for e in state["trace"])
+    assert "Hard business rule override" not in state["decision"].reasoning
+    assert "out_of_stock" in state["decision"].reasoning
 
 
 class AmnesiacExtractor(FakeBrain):

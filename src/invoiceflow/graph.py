@@ -162,7 +162,25 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
         )
 
         updates: dict = {"critique_rounds": [CritiqueRound(decision=decision, critique=crit)]}
-        if crit.verdict == CritiqueVerdict.ESCALATE or exhausted:
+        # Precedence, top to bottom: hard rules outrank the Critic, which
+        # outranks the Approver. must_reject terminates the chain — no verdict
+        # below can soften it, not even an escalation to a human.
+        if constraints.must_reject:
+            # Already what the rules demand: leave the Approver's own reasoning
+            # in place, and keep `hard_rule_override` meaning what it says —
+            # an agent tried to talk its way past a hard rule.
+            if decision.status != ApprovalStatus.REJECTED:
+                updates["decision"] = decision.model_copy(
+                    update={
+                        "status": ApprovalStatus.REJECTED,
+                        "reasoning": "Hard business rule override: critical validation failures "
+                        "forbid approval. " + "; ".join(constraints.reject_reasons),
+                    }
+                )
+                trace.append(
+                    _ev("approval", "hard_rule_override", f"{decision.status} -> rejected")
+                )
+        elif crit.verdict == CritiqueVerdict.ESCALATE or exhausted:
             reason = (
                 "Approver and Critic could not converge; escalating to a human."
                 if exhausted
@@ -175,18 +193,6 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
                 }
             )
             trace.append(_ev("approval", "escalated", reason))
-        elif crit.verdict == CritiqueVerdict.ACCEPT and (
-            decision.status == ApprovalStatus.APPROVED and constraints.must_reject
-        ):
-            # Defense in depth: hard rules outrank both agents.
-            updates["decision"] = decision.model_copy(
-                update={
-                    "status": ApprovalStatus.REJECTED,
-                    "reasoning": "Hard business rule override: critical validation failures "
-                    "forbid approval. " + "; ".join(constraints.reject_reasons),
-                }
-            )
-            trace.append(_ev("approval", "hard_rule_override", "approved -> rejected"))
         updates["trace"] = trace
         return updates
 
@@ -238,11 +244,20 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
         return "record" if state["report"].is_exact_duplicate else "approve"
 
     def after_critique(state: PipelineState) -> str:
+        constraints = state["constraints"]
         rounds = state["critique_rounds"]
         verdict = rounds[-1].critique.verdict
-        if verdict == CritiqueVerdict.REVISE and len(rounds) <= settings.max_critique_rounds:
+        if (
+            verdict == CritiqueVerdict.REVISE
+            # A hard rejection is already settled: another Approver round could
+            # only reword a decision the rules have decided.
+            and not constraints.must_reject
+            and len(rounds) <= settings.max_critique_rounds
+        ):
             return "approve"
-        if state["decision"].status == ApprovalStatus.APPROVED:
+        # The invariant, stated on the one edge where money moves: a hard
+        # rejection is never paid, whatever the two agents concluded.
+        if state["decision"].status == ApprovalStatus.APPROVED and not constraints.must_reject:
             return "pay"
         return "record"
 
