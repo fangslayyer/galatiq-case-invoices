@@ -39,6 +39,8 @@ class IssueCode(StrEnum):
     # duplicates
     DUPLICATE_INVOICE = "duplicate_invoice"
     REVISED_INVOICE = "revised_invoice"
+    # prompt safety
+    PROMPT_INJECTION_ATTEMPT = "prompt_injection_attempt"
     # free-form observation from an agent
     AGENT_OBSERVATION = "agent_observation"
 

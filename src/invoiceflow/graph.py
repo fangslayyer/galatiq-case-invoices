@@ -28,11 +28,12 @@ from .models import (
     IssueCode,
     Severity,
     TraceEvent,
+    ValidationReport,
 )
 from .payment import execute_payment
 from .rules import evaluate_rules
 from .state import PipelineState
-from .validation import ValidationContext
+from .validation import ValidationContext, forged_fence_issue
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +45,25 @@ def _ev(stage: str, event: str, detail: str = "") -> TraceEvent:
     return TraceEvent(stage=stage, event=event, detail=detail)
 
 
+def _prompt_safety_gate(raw_text: str) -> ValidationReport | None:
+    """Quarantine verdict for a freshly loaded document, or None if it is clean.
+
+    Runs before the Extractor, because the Extractor is itself an LLM: a
+    document that forges prompt fences must not reach *any* model, only a
+    human. The returned report is what the run carries in place of a real
+    validation pass, so the finding surfaces in the persisted result.
+    """
+    issue = forged_fence_issue(raw_text)
+    if issue is None:
+        return None
+    return ValidationReport(
+        issues=[issue],
+        summary="Quarantined at ingestion: this document forged the pipeline's own prompt "
+        "fences, so it was never shown to a language model. Needs a human reader.",
+        tools_used=["prompt_safety_gate"],
+    )
+
+
 def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
     def ingest(state: PipelineState) -> dict:
         trace = [_ev("ingestion", "loading", state["source_file_path"])]
@@ -52,6 +72,16 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
         except (OSError, ValueError) as exc:
             trace.append(_ev("ingestion", "load_failed", str(exc)))
             return {"error": str(exc), "final_status": FinalStatus.FAILED, "trace": trace}
+        quarantine = _prompt_safety_gate(raw_text)
+        if quarantine is not None:
+            reason = quarantine.issues[0].detail
+            trace.append(_ev("ingestion", "quarantined", reason))
+            return {
+                "raw_text": raw_text,
+                "quarantine_reason": reason,
+                "report": quarantine,
+                "trace": trace,
+            }
         catalog = [rec.item for rec in db.all_items()]
         try:
             invoice, retries = run_extractor(
@@ -87,7 +117,10 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
 
     def validate(state: PipelineState) -> dict:
         ctx = ValidationContext(
-            invoice=state["invoice"], db=db, expected_currency=settings.expected_currency
+            invoice=state["invoice"],
+            db=db,
+            expected_currency=settings.expected_currency,
+            raw_text=state.get("raw_text", ""),
         )
         report = run_validator(llm, ctx)
         trace = [
@@ -199,7 +232,9 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
     # -- routing ------------------------------------------------------------
 
     def after_ingest(state: PipelineState) -> str:
-        return "record" if state.get("error") else "validate"
+        if state.get("error") or state.get("quarantine_reason"):
+            return "record"
+        return "validate"
 
     def after_validate(state: PipelineState) -> str:
         report = state["report"]
@@ -261,6 +296,10 @@ def export_graph_image(compiled, out_dir: Path = DOCS_DIR) -> None:
 def _final_status(state: PipelineState) -> FinalStatus:
     if state.get("error"):
         return FinalStatus.FAILED
+    if state.get("quarantine_reason"):
+        # Never auto-rejected: deciding whether a forged fence is an attack or
+        # an artifact is the one judgement no agent here is fit to make.
+        return FinalStatus.NEEDS_REVIEW
     report = state.get("report")
     if report is not None and any(
         i.code == IssueCode.DUPLICATE_INVOICE and i.severity == Severity.CRITICAL

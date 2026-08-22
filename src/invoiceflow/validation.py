@@ -15,6 +15,7 @@ from langchain_core.tools import BaseTool, tool
 
 from .db import Database
 from .models import Invoice, IssueCode, Severity, ValidationIssue
+from .prompts import Tag
 
 MONEY_TOLERANCE = 0.01
 
@@ -26,6 +27,9 @@ class ValidationContext:
     invoice: Invoice
     db: Database
     expected_currency: str = "USD"
+    # The document as loaded, before any agent saw it — the only text that can
+    # carry an injection attempt. Empty when a caller checks an invoice alone.
+    raw_text: str = ""
     issues: list[ValidationIssue] = field(default_factory=list)
     tools_used: list[str] = field(default_factory=list)
 
@@ -176,11 +180,42 @@ def check_duplicate(ctx: ValidationContext) -> str:
     return _report(ctx, "check_duplicate", ctx.issues[before:])
 
 
+def forged_fence_issue(raw_text: str) -> ValidationIssue | None:
+    """The prompt-safety verdict on a raw document, or None if it is clean.
+
+    Takes text rather than a ValidationContext because the ingest gate runs it
+    before an Invoice exists — see `_prompt_safety_gate` in graph.py. That gate
+    is the real defense; `check_prompt_safety` below is the backstop for any
+    path that reaches the validator without passing it.
+    """
+    forged = Tag.scan(raw_text)
+    if not forged:
+        return None
+    labels = ", ".join(sorted(f"<{tag}>" for tag in forged))
+    return ValidationIssue(
+        code=IssueCode.PROMPT_INJECTION_ATTEMPT,
+        severity=Severity.WARNING,
+        detail=f"source document contains this pipeline's own fence label(s) {labels}; "
+        "it is trying to forge prompt structure",
+    )
+
+
+def check_prompt_safety(ctx: ValidationContext) -> str:
+    """Detect a prompt-injection attempt: fence labels this pipeline uses,
+    forged inside the vendor-supplied document text."""
+    before = len(ctx.issues)
+    issue = forged_fence_issue(ctx.raw_text)
+    if issue is not None:
+        ctx.issues.append(issue)
+    return _report(ctx, "check_prompt_safety", ctx.issues[before:])
+
+
 ALL_CHECKS = {
     "check_inventory": check_inventory,
     "verify_arithmetic": verify_arithmetic,
     "check_integrity": check_integrity,
     "check_duplicate": check_duplicate,
+    "check_prompt_safety": check_prompt_safety,
 }
 
 

@@ -34,6 +34,9 @@ class PipelineState(TypedDict, total=False):
 
     # Produced as the pipeline runs.
     raw_text: str
+    # Set only by the ingest gate: the document forged prompt structure, so it
+    # was never shown to an LLM. Distinct from `error` — this is not a failure.
+    quarantine_reason: str
     invoice: Invoice
     extraction_retries: int
     report: ValidationReport
