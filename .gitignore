@@ -14,3 +14,9 @@ results/
 
 # Secrets
 .env
+
+# Personal scratch pads
+scratch/
+
+# IDE
+.vscode/

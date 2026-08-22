@@ -1,0 +1,19 @@
+# Line endings: LF in the repository and in the working tree, so a checkout on
+# Windows (or a WSL/Windows mix, as here) never turns a whole file into a
+# phantom diff. Nothing tracked currently uses CRLF, so this is a no-op today
+# and a guardrail tomorrow.
+* text=auto eol=lf
+
+# --- Generated, not authored -------------------------------------------------
+uv.lock           linguist-generated=true
+requirements.txt  linguist-generated=true
+docs/graph.mmd    linguist-generated=true
+docs/graph.png    linguist-generated=true
+
+# --- Binary: never diffed or merged line by line -----------------------------
+*.pdf   binary
+*.png   binary
+*.db    binary
+
+# --- Provided case material, not our source ----------------------------------
+data/invoices/**  linguist-vendored=true
