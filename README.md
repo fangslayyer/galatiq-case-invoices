@@ -35,7 +35,7 @@ never call each other directly, so every hop is inspectable and testable.
 graph TD
     A[Invoice file<br/>txt / json / csv / xml / pdf] --> B[Loader]
     B --> C{{"🤖 Extractor<br/>structured Invoice"}}
-    C -- "schema errors → retry ≤2" --> C
+    C -.->|"self-correction ≤2<br/>(inside the agent)"| C
     C -- unrecoverable --> Q[🟡 Escalation queue]
     C --> D{{"🤖 Validator<br/>ReAct tool loop"}}
     D <--> T1[(check_inventory<br/>verify_arithmetic<br/>check_integrity<br/>check_duplicate)]
@@ -43,7 +43,7 @@ graph TD
     D --> E{{"🤖 Approver"}}
     R[Rule engine<br/>&gt;$10K scrutiny · hard rejects] --> E
     E --> F{{"🤖 Critic<br/>fraud checklist"}}
-    F -- "revise ≤2 rounds" --> E
+    F -- "revise ≤2 rounds<br/>(graph cycle)" --> E
     F -- deadlock --> Q
     F -- rejected --> L[Rejection log]
     F -- approved --> G{{"🤖 Payer"}}
@@ -55,18 +55,30 @@ graph TD
     S -- human override --> G
 ```
 
-That diagram is the conceptual flow. The graph LangGraph *actually* compiles is
-exported on every `build_graph()` call, so the picture can never drift from the
-code — mermaid source alongside it in [docs/graph.mmd](docs/graph.mmd):
+That diagram is the conceptual flow, not the graph: the tool cylinders, the rule
+engine and the dashboard are code called *inside* nodes, not nodes themselves.
+
+The **dotted self-loop on the Extractor** marks the one distinction worth
+knowing before you go reading: it is a `for` loop inside
+[`run_extractor`](src/invoiceflow/agents.py) that feeds each failure back into
+the next prompt — *not* a cycle in the graph, so it appears nowhere in graph.py.
+The Approver ↔ Critic revision arrow is the opposite: a real conditional edge
+routing `critique` back to `approve`. Both are called self-correction loops
+below; only one is a LangGraph edge.
+
+The graph LangGraph *actually* compiles is exported on every `build_graph()`
+call, so the picture can never drift from the code (mermaid source alongside it
+in [docs/graph.mmd](docs/graph.mmd)) — note it has no self-edge on `ingest`,
+and the approve/critique cycle is right there:
 
 <img src="docs/graph.png" alt="Compiled LangGraph topology" width="200">
 
 | Agent | Role | Agentic pattern |
 |---|---|---|
-| **Extractor** | Messy text → structured `Invoice` (canonical item names, OCR fixes) | Self-correction loop #1: schema/sanity errors fed back, ≤2 retries |
+| **Extractor** | Messy text → structured `Invoice` (canonical item names, OCR fixes) | Self-correction loop #1, **in-agent**: schema/sanity errors fed back into the next prompt, ≤2 retries |
 | **Validator** | Interrogates the invoice against inventory & records | ReAct tool-calling loop over 4 deterministic tools |
 | **Approver** | Drafts approve / reject / needs-review with business rationale | Proposer in a reflection pair |
-| **Critic** | Adversarial audit against a fraud & scrutiny checklist | Self-correction loop #2: can force revisions or escalate to a human |
+| **Critic** | Adversarial audit against a fraud & scrutiny checklist | Self-correction loop #2, **a graph cycle**: can force revisions or escalate to a human |
 | **Payer** | Executes the mock payment or logs the rejection | Guarded tool execution (never pays twice) |
 
 ### Design decisions
@@ -75,6 +87,14 @@ code — mermaid source alongside it in [docs/graph.mmd](docs/graph.mmd):
   artifacts, five file formats, weird layouts — is Grok's job via structured
   output. A regex/heuristic fallback would be brittle in exactly the ways
   this exercise is about, so none exists.
+- **Two self-correction loops, two mechanisms — deliberately.** The rule is
+  whether the loop's intermediate state belongs in the audit trail. Each
+  Approver/Critic round is evidence a human reviewer may need, so it is a graph
+  cycle and every round is persisted in `critique_rounds`. A malformed first
+  extraction draft is a mechanical detail, so it stays an in-agent loop and only
+  the *count* surfaces, as `extraction_retries`. Promoting it to a graph cycle
+  would push `raw_text`, the catalog and per-attempt feedback into the
+  pipeline-wide state and into every run's JSON, for no reviewer's benefit.
 - **Deterministic where the answer is checkable.** Stock aggregation,
   arithmetic verification, duplicate detection, and hard approval rules are
   plain, unit-tested Python exposed to the agents as tools. The LLM decides
@@ -169,10 +189,9 @@ src/invoiceflow/
   agents.py              Extractor / Validator / Approver / Critic prompts & loops
   validation.py          deterministic validation tools (the Validator's toolbox)
   rules.py               hard business rules constraining the Approver
-  llm.py                 Grok factory (the only reasoning engine)
   models.py              Pydantic schemas for every agent's structured output
   db.py                  SQLite inventory + processed-invoice registry
-  pipeline.py            run wrapper: run IDs, timing, persisted JSON results
+  pipeline.py            run wrapper: Grok factory, run IDs, timing, JSON results
   cli.py                 rich terminal UI: per-stage trace, batch summary
 ui/app.py                Streamlit dashboard: runs browser + escalation queue
 tests/                   65 tests (61 offline + 4 live-marked)

@@ -14,8 +14,8 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from pydantic import BaseModel
 
-from . import prompts
 from .models import ApprovalDecision, Critique, Invoice, ValidationReport, ValidatorSummary
+from .prompts import Tag
 from .rules import RuleConstraints
 from .validation import ALL_CHECKS, ValidationContext, build_tools
 
@@ -73,10 +73,10 @@ def run_extractor(
     feedback: list[str] = []
     last_error = ""
     for attempt in range(max_retries + 1):
-        human = prompts.block(prompts.DOC_TAG, raw_text)
+        human = Tag.DOC.wrap(raw_text)
         if feedback:
-            human += "\n\nYour previous attempt failed. Fix these problems:\n" + prompts.block(
-                prompts.ERRORS_TAG, "\n".join(feedback)
+            human += "\n\nYour previous attempt failed. Fix these problems:\n" + Tag.ERRORS.wrap(
+                "\n".join(feedback)
             )
         try:
             invoice = _ask(llm, Invoice, [system, HumanMessage(human)])
@@ -121,8 +121,7 @@ def run_validator(llm: BaseChatModel, ctx: ValidationContext) -> ValidationRepor
     messages: list[BaseMessage] = [
         SystemMessage(VALIDATOR_SYSTEM),
         HumanMessage(
-            "Validate this invoice:\n"
-            + prompts.block(prompts.INVOICE_TAG, ctx.invoice.model_dump_json(indent=2))
+            "Validate this invoice:\n" + Tag.INVOICE.wrap(ctx.invoice.model_dump_json(indent=2))
         ),
     ]
     for _ in range(MAX_TOOL_ROUNDS):
@@ -151,9 +150,9 @@ def run_validator(llm: BaseChatModel, ctx: ValidationContext) -> ValidationRepor
                 "only for genuine problems you noticed that no tool reported."
             ),
             HumanMessage(
-                prompts.block(prompts.INVOICE_TAG, ctx.invoice.model_dump_json(indent=2))
+                Tag.INVOICE.wrap(ctx.invoice.model_dump_json(indent=2))
                 + "\n"
-                + prompts.block(prompts.ISSUES_TAG, issues_json)
+                + Tag.ISSUES.wrap(issues_json)
             ),
         ],
     )
@@ -200,9 +199,9 @@ def _decision_context(
 ) -> str:
     return "\n".join(
         [
-            prompts.block(prompts.INVOICE_TAG, invoice.model_dump_json(indent=2)),
-            prompts.block(prompts.REPORT_TAG, report.model_dump_json(indent=2)),
-            prompts.block(prompts.CONSTRAINTS_TAG, constraints.model_dump_json(indent=2)),
+            Tag.INVOICE.wrap(invoice.model_dump_json(indent=2)),
+            Tag.REPORT.wrap(report.model_dump_json(indent=2)),
+            Tag.CONSTRAINTS.wrap(constraints.model_dump_json(indent=2)),
         ]
     )
 
@@ -216,8 +215,9 @@ def run_approver(
 ) -> ApprovalDecision:
     human = "Decide on this invoice:\n" + _decision_context(invoice, report, constraints)
     if critic_feedback:
-        human += "\n\nThe Critic rejected your previous decision — address this:\n" + prompts.block(
-            prompts.FEEDBACK_TAG, critic_feedback
+        human += (
+            "\n\nThe Critic rejected your previous decision — address this:\n"
+            + Tag.FEEDBACK.wrap(critic_feedback)
         )
     return _ask(llm, ApprovalDecision, [SystemMessage(APPROVER_SYSTEM), HumanMessage(human)])
 
@@ -231,7 +231,7 @@ def run_critic(
 ) -> Critique:
     human = (
         "Audit this proposed decision:\n"
-        + prompts.block(prompts.DECISION_TAG, decision.model_dump_json(indent=2))
+        + Tag.DECISION.wrap(decision.model_dump_json(indent=2))
         + "\n"
         + _decision_context(invoice, report, constraints)
     )

@@ -26,7 +26,7 @@ class PipelineState(TypedDict, total=False):
     """
 
     # Supplied by Pipeline.run() at invoke time — present at every node.
-    source_file: Required[str]
+    source_file_path: Required[str]
     run_id: Required[str]
     started_at: Required[str]
     trace: Required[Annotated[list[TraceEvent], operator.add]]

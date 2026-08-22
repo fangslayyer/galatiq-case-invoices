@@ -127,7 +127,7 @@ def test_hard_rules_outrank_a_rogue_approver(settings, db, ground_truth):
     graph = build_graph(settings, db, RogueApprover(extractions=ground_truth))
     state = graph.invoke(
         {
-            "source_file": str(INVOICES_DIR / "invoice_1003.txt"),  # fraud: zero-stock item
+            "source_file_path": str(INVOICES_DIR / "invoice_1003.txt"),  # fraud: zero-stock item
             "run_id": "rogue-test",
             "started_at": "",
             "trace": [],
@@ -166,7 +166,7 @@ def test_extractor_self_correction_recovers(settings, db, ground_truth):
     graph = build_graph(settings, db, AmnesiacExtractor(extractions=ground_truth))
     state = graph.invoke(
         {
-            "source_file": str(INVOICES_DIR / "invoice_1001.txt"),
+            "source_file_path": str(INVOICES_DIR / "invoice_1001.txt"),
             "run_id": "retry-test",
             "started_at": "",
             "trace": [],

@@ -46,9 +46,9 @@ def _ev(stage: str, event: str, detail: str = "") -> TraceEvent:
 
 def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
     def ingest(state: PipelineState) -> dict:
-        trace = [_ev("ingestion", "loading", state["source_file"])]
+        trace = [_ev("ingestion", "loading", state["source_file_path"])]
         try:
-            raw_text = load_invoice_text(state["source_file"])
+            raw_text = load_invoice_text(state["source_file_path"])
         except (OSError, ValueError) as exc:
             trace.append(_ev("ingestion", "load_failed", str(exc)))
             return {"error": str(exc), "final_status": FinalStatus.FAILED, "trace": trace}

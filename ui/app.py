@@ -153,7 +153,7 @@ with tab_queue:
         header = (
             f"{result.invoice.invoice_number} · {result.invoice.vendor or 'unknown vendor'}"
             if result.invoice
-            else result.source_file
+            else result.source_file_path
         )
         with st.container(border=True):
             st.subheader(header)

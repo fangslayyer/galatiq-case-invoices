@@ -11,6 +11,7 @@ from invoiceflow.models import (
     ValidationIssue,
     ValidationReport,
 )
+from invoiceflow.prompts import Tag
 from invoiceflow.rules import evaluate_rules
 from invoiceflow.validation import ValidationContext
 from tests.fakes import FakeBrain
@@ -103,3 +104,22 @@ class TestValidatorAgent:
         }
         assert report.issues == []
         assert report.summary
+
+
+class TestPromptTags:
+    def test_every_tag_round_trips(self):
+        """wrap/find are a matched pair — edit one format and this fails."""
+        content = "line one\nline two\n  indented {json: true}"
+        for tag in Tag:
+            assert tag.unwrap(tag.wrap(content)) == content
+
+    def test_find_returns_none_when_absent(self):
+        # The fakes rely on this: a missing block falls back to "{}", it must
+        # not raise or match a neighbouring tag's content.
+        text = Tag.INVOICE.wrap('{"invoice_number": "INV-1"}')
+        assert Tag.CONSTRAINTS.unwrap(text) is None
+
+    def test_tags_interpolate_as_their_value(self):
+        # Guards the StrEnum choice: a plain `str, Enum` mixin would emit
+        # "<Tag.DOC>" into live prompts instead of the real fence.
+        assert Tag.DOC.wrap("x") == "<invoice_document>\nx\n</invoice_document>"

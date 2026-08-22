@@ -1,5 +1,11 @@
 """Top-level pipeline runner: wraps the graph with run IDs, timing, and
-persisted results — the observability layer the CLI and dashboard read."""
+persisted results — the observability layer the CLI and dashboard read.
+
+It also owns the LLM factory, since this is the only place one is built: xAI
+Grok is the single reasoning engine. "Offline" in the case brief means no
+external non-Grok APIs (payment and inventory are mocked locally), not a
+hand-rolled backup brain — tests inject a fake chat model through `llm`.
+"""
 
 from __future__ import annotations
 
@@ -9,14 +15,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from langchain_core.language_models import BaseChatModel
+from pydantic import SecretStr
 
 from .config import Settings, langsmith_project
 from .db import Database
 from .graph import build_graph
-from .llm import build_llm
 from .models import FinalStatus, InvoiceRunResult
+from .state import PipelineState
 
 log = logging.getLogger(__name__)
+
+
+class MissingApiKeyError(RuntimeError):
+    pass
 
 
 class Pipeline:
@@ -24,7 +35,24 @@ class Pipeline:
         """`llm` lets tests inject a fake brain; production always uses Grok."""
         self.settings = settings or Settings()
         self.db = Database(self.settings.db_path)
-        self.llm = llm if llm is not None else build_llm(self.settings)
+
+        if llm is not None:
+            self.llm = llm
+        else:
+            # Only the real Grok path needs a key: an injected brain (tests,
+            # notebooks) must keep working with no credentials at all.
+            api_key = self.settings.resolve_api_key()
+            if not api_key:
+                raise MissingApiKeyError(
+                    "XAI_API_KEY is not set. Export it or put it in .env — the pipeline's "
+                    "reasoning engine is xAI Grok and there is no non-LLM fallback."
+                )
+            from langchain_xai import ChatXAI  # deferred: importing langchain is slow
+
+            self.llm = ChatXAI(
+                model=self.settings.grok_model, api_key=SecretStr(api_key), temperature=0
+            )
+
         self.graph = build_graph(self.settings, self.db, self.llm)
         project = langsmith_project()
         if project:
@@ -40,28 +68,32 @@ class Pipeline:
         started = datetime.now(UTC).isoformat(timespec="seconds")
         log.info("run %s: processing %s (backend=%s)", run_id, invoice_path, self.backend)
 
+        # Annotated, not a bare literal: this is the other half of the contract in
+        # state.py, so a missing or misspelled Required key is a type error here
+        # rather than a reducer that silently never fires.
+        initial: PipelineState = {
+            "source_file_path": str(invoice_path),
+            "run_id": run_id,
+            "started_at": started,
+            "trace": [],
+            "critique_rounds": [],
+        }
         state = self.graph.invoke(
-            {
-                "source_file": str(invoice_path),
-                "run_id": run_id,
-                "started_at": started,
-                "trace": [],
-                "critique_rounds": [],
-            },
+            initial,
             # Names and labels the trace tree when LangSmith is on; inert otherwise.
             config={
                 "run_name": f"invoice {invoice_path.name}",
                 "tags": ["invoiceflow", self.backend],
                 "metadata": {
                     "run_id": run_id,
-                    "source_file": str(invoice_path),
+                    "source_file_path": str(invoice_path),
                     "llm_backend": self.backend,
                 },
             },
         )
         result = InvoiceRunResult(
             run_id=run_id,
-            source_file=str(invoice_path),
+            source_file_path=str(invoice_path),
             started_at=started,
             finished_at=datetime.now(UTC).isoformat(timespec="seconds"),
             llm_backend=self.backend,

@@ -192,7 +192,7 @@ class InvoiceRunResult(BaseModel):
     """Everything about one invoice's trip through the pipeline; persisted as JSON."""
 
     run_id: str
-    source_file: str
+    source_file_path: str
     started_at: str
     finished_at: str = ""
     llm_backend: str = ""

@@ -22,7 +22,6 @@ from langchain_core.runnables import Runnable, RunnableLambda
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import Field
 
-from invoiceflow import prompts
 from invoiceflow.models import (
     ApprovalDecision,
     ApprovalStatus,
@@ -31,6 +30,7 @@ from invoiceflow.models import (
     Invoice,
     ValidatorSummary,
 )
+from invoiceflow.prompts import Tag
 
 
 def _messages_text(messages: list[BaseMessage]) -> str:
@@ -91,7 +91,7 @@ class FakeBrain(BaseChatModel):
         return RunnableLambda(respond)
 
     def _lookup_extraction(self, text: str) -> Invoice:
-        doc = prompts.extract_block(text, prompts.DOC_TAG)
+        doc = Tag.DOC.unwrap(text)
         if doc is None:
             raise ValueError("FakeBrain: no invoice document block in prompt")
         try:
@@ -104,7 +104,7 @@ class FakeBrain(BaseChatModel):
 
 
 def _fake_summary(text: str) -> ValidatorSummary:
-    issues = json.loads(prompts.extract_block(text, prompts.ISSUES_TAG) or "[]")
+    issues = json.loads(Tag.ISSUES.unwrap(text) or "[]")
     if not issues:
         return ValidatorSummary(summary="All checks passed; the invoice looks consistent.")
     crit = sum(1 for i in issues if i["severity"] == "critical")
@@ -116,7 +116,7 @@ def _fake_summary(text: str) -> ValidatorSummary:
 
 
 def _fake_decision(text: str) -> ApprovalDecision:
-    constraints = json.loads(prompts.extract_block(text, prompts.CONSTRAINTS_TAG) or "{}")
+    constraints = json.loads(Tag.CONSTRAINTS.unwrap(text) or "{}")
     if constraints.get("must_reject"):
         return ApprovalDecision(
             status=ApprovalStatus.REJECTED,
@@ -143,8 +143,8 @@ def _fake_decision(text: str) -> ApprovalDecision:
 
 
 def _fake_critique(text: str) -> Critique:
-    decision = json.loads(prompts.extract_block(text, prompts.DECISION_TAG) or "{}")
-    constraints = json.loads(prompts.extract_block(text, prompts.CONSTRAINTS_TAG) or "{}")
+    decision = json.loads(Tag.DECISION.unwrap(text) or "{}")
+    constraints = json.loads(Tag.CONSTRAINTS.unwrap(text) or "{}")
     status = decision.get("status")
     if status == "approved" and constraints.get("must_reject"):
         return Critique(

@@ -86,8 +86,8 @@ def main(
         console.print("Nothing to do: pass [bold]--invoice_path FILE[/bold] or [bold]--all[/bold].")
         raise typer.Exit(1)
 
-    from .llm import MissingApiKeyError
-    from .pipeline import Pipeline  # deferred: importing langchain is slow
+    # deferred: importing langchain is slow
+    from .pipeline import MissingApiKeyError, Pipeline
 
     try:
         pipeline = Pipeline(settings)
@@ -164,7 +164,7 @@ def _render_summary(results: list[InvoiceRunResult]) -> None:
             findings = r.error
         style = STATUS_STYLE[r.final_status]
         table.add_row(
-            Path(r.source_file).name,
+            Path(r.source_file_path).name,
             inv.invoice_number if inv else "—",
             (inv.vendor or "—") if inv else "—",
             _money(inv.total, inv.currency) if inv else "—",
