@@ -63,13 +63,13 @@ knowing before you go reading: it is a `for` loop inside
 [`run_extractor`](src/invoiceflow/agents.py) that feeds each failure back into
 the next prompt — *not* a cycle in the graph, so it appears nowhere in graph.py.
 The Approver ↔ Critic revision arrow is the opposite: a real conditional edge
-routing `critique` back to `approve`. Both are called self-correction loops
-below; only one is a LangGraph edge.
+routing `critique` back to `decide` (the node the Approver runs in). Both are
+called self-correction loops below; only one is a LangGraph edge.
 
 The graph LangGraph *actually* compiles is exported on every `build_graph()`
 call, so the picture can never drift from the code (mermaid source alongside it
 in [docs/graph.mmd](docs/graph.mmd)) — note it has no self-edge on `ingest`,
-and the approve/critique cycle is right there:
+and the `decide`/`critique` cycle is right there:
 
 <img src="docs/graph.png" alt="Compiled LangGraph topology" width="200">
 

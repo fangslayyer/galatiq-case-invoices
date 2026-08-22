@@ -7,20 +7,20 @@ graph TD;
 	__start__([<p>__start__</p>]):::first
 	ingest(ingest)
 	validate(validate)
-	approve(approve)
+	decide(decide)
 	critique(critique)
 	pay(pay)
 	record(record)
 	__end__([<p>__end__</p>]):::last
 	__start__ --> ingest;
-	approve --> critique;
-	critique -.-> approve;
+	critique -.-> decide;
 	critique -.-> pay;
 	critique -.-> record;
+	decide --> critique;
 	ingest -.-> record;
 	ingest -.-> validate;
 	pay --> record;
-	validate -.-> approve;
+	validate -.-> decide;
 	validate -.-> record;
 	record --> __end__;
 	classDef default fill:#f2f0ff,line-height:1.2

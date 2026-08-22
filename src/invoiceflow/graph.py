@@ -1,8 +1,8 @@
 """The LangGraph StateGraph that orchestrates the agents.
 
-    ingest -> validate -> approve <-> critique -> pay -> record
-                 |                        |
-                 +--(exact duplicate)-----+--(reject / review)--> record
+    ingest -> validate -> decide <-> critique -> pay -> record
+                 |                       |
+                 +--(exact duplicate)----+--(reject / review)--> record
 
 Agents never call each other directly: conditional edges route on each
 agent's structured output, which keeps the flow inspectable and testable.
@@ -134,7 +134,7 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
             )
         return {"report": report, "trace": trace}
 
-    def approve(state: PipelineState) -> dict:
+    def decide(state: PipelineState) -> dict:
         constraints = state.get("constraints") or evaluate_rules(
             state["invoice"], state["report"], settings.scrutiny_threshold
         )
@@ -241,7 +241,7 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
         return "validate"
 
     def after_validate(state: PipelineState) -> str:
-        return "record" if state["report"].is_exact_duplicate else "approve"
+        return "record" if state["report"].is_exact_duplicate else "decide"
 
     def after_critique(state: PipelineState) -> str:
         constraints = state["constraints"]
@@ -254,7 +254,7 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
             and not constraints.must_reject
             and len(rounds) <= settings.max_critique_rounds
         ):
-            return "approve"
+            return "decide"  # back to the Approver for another draft
         # The invariant, stated on the one edge where money moves: a hard
         # rejection is never paid, whatever the two agents concluded.
         if state["decision"].status == ApprovalStatus.APPROVED and not constraints.must_reject:
@@ -264,15 +264,15 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
     graph = StateGraph(PipelineState)
     graph.add_node("ingest", ingest)
     graph.add_node("validate", validate)
-    graph.add_node("approve", approve)
+    graph.add_node("decide", decide)
     graph.add_node("critique", critique)
     graph.add_node("pay", pay)
     graph.add_node("record", record)
     graph.set_entry_point("ingest")
     graph.add_conditional_edges("ingest", after_ingest, ["validate", "record"])
-    graph.add_conditional_edges("validate", after_validate, ["approve", "record"])
-    graph.add_edge("approve", "critique")
-    graph.add_conditional_edges("critique", after_critique, ["approve", "pay", "record"])
+    graph.add_conditional_edges("validate", after_validate, ["decide", "record"])
+    graph.add_edge("decide", "critique")
+    graph.add_conditional_edges("critique", after_critique, ["decide", "pay", "record"])
     graph.add_edge("pay", "record")
     graph.add_edge("record", END)
     compiled = graph.compile()
