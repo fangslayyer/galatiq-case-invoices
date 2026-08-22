@@ -117,6 +117,13 @@ def _fake_summary(text: str) -> ValidatorSummary:
 
 def _fake_decision(text: str) -> ApprovalDecision:
     constraints = json.loads(Tag.CONSTRAINTS.unwrap(text) or "{}")
+    if constraints.get("must_review"):  # outranks must_reject
+        return ApprovalDecision(
+            status=ApprovalStatus.NEEDS_REVIEW,
+            reasoning="Cannot be decided automatically: "
+            + "; ".join(constraints.get("review_reasons", [])),
+            risk_factors=constraints.get("review_reasons", []),
+        )
     if constraints.get("must_reject"):
         return ApprovalDecision(
             status=ApprovalStatus.REJECTED,
@@ -146,6 +153,12 @@ def _fake_critique(text: str) -> Critique:
     decision = json.loads(Tag.DECISION.unwrap(text) or "{}")
     constraints = json.loads(Tag.CONSTRAINTS.unwrap(text) or "{}")
     status = decision.get("status")
+    if status != "needs_review" and constraints.get("must_review"):
+        return Critique(
+            verdict=CritiqueVerdict.REVISE,
+            feedback="The rules forbid deciding this invoice automatically: "
+            + "; ".join(constraints.get("review_reasons", [])),
+        )
     if status == "approved" and constraints.get("must_reject"):
         return Critique(
             verdict=CritiqueVerdict.REVISE,

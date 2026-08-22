@@ -13,7 +13,7 @@ from rich.table import Table
 from .config import PROJECT_ROOT, Settings, langsmith_project
 from .db import Database
 from .loaders import SUPPORTED_EXTENSIONS
-from .models import FinalStatus, InvoiceRunResult, Severity
+from .models import FinalStatus, InvoiceRunResult, PaymentStatus, Severity
 
 app = typer.Typer(add_completion=False, rich_markup_mode="rich")
 console = Console()
@@ -135,7 +135,7 @@ def _render_run(result: InvoiceRunResult) -> None:
     body = f"[{style}]{result.final_status.upper()}[/{style}]"
     if result.decision is not None:
         body += f"\n{result.decision.reasoning}"
-    if result.payment is not None and result.payment.status == "success":
+    if result.payment is not None and result.payment.status == PaymentStatus.SUCCESS:
         body += (
             f"\n[green]Payment sent:[/green] "
             f"${result.payment.amount:,.2f} → {result.payment.vendor}"

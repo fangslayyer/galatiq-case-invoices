@@ -1,7 +1,8 @@
 import pytest
 
 from invoiceflow.loaders import UnsupportedFormatError, load_invoice_text
-from invoiceflow.payment import execute_payment
+from invoiceflow.models import PaymentStatus
+from invoiceflow.payment import UnpayableInvoiceError, execute_payment
 from tests.conftest import INVOICES_DIR
 from tests.test_validation import make_invoice
 
@@ -26,8 +27,15 @@ class TestLoaders:
 class TestPaymentIdempotency:
     def test_pays_unseen_invoice(self, db, capsys):
         result = execute_payment(db, make_invoice(), "run-1")
-        assert result.status == "success"
+        assert result.status == PaymentStatus.SUCCESS
         assert "Paid 500.0 to Test Vendor" in capsys.readouterr().out
+
+    def test_refuses_an_invoice_with_no_total(self, db, capsys):
+        # Unreachable through the graph, but it must fail loudly rather than
+        # pay $0.00 and record the invoice as settled.
+        with pytest.raises(UnpayableInvoiceError):
+            execute_payment(db, make_invoice(total=None), "run-x")
+        assert "Paid" not in capsys.readouterr().out
 
     def test_refuses_double_payment(self, db, capsys):
         inv = make_invoice()
@@ -35,5 +43,5 @@ class TestPaymentIdempotency:
             inv.invoice_number, inv.content_hash(), inv.vendor, inv.total, "paid", "r1"
         )
         result = execute_payment(db, inv, "run-2")
-        assert result.status == "skipped_already_paid"
+        assert result.status == PaymentStatus.SKIPPED_ALREADY_PAID
         assert "Paid" not in capsys.readouterr().out

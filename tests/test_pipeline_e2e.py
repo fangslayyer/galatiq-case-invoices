@@ -5,8 +5,11 @@ LLM (validation tools, rules, reflection loop, routing, registry, payment)
 runs for real. Extraction itself is verified against live Grok in
 test_live_grok.py.
 
-The expected statuses are the case's acceptance table. `fresh` expectations
-assume an empty processed-invoice registry.
+The expected statuses are this system's policy, not the case brief's: CASE.md
+scopes its sample-invoice table to validation and says each problem invoice is
+"flagged", never that it is rejected. Mapping a flagged finding to reject vs.
+needs_review is our call, recorded here. `fresh` expectations assume an empty
+processed-invoice registry.
 """
 
 import pytest
@@ -20,6 +23,7 @@ from invoiceflow.models import (
     FinalStatus,
     Invoice,
     IssueCode,
+    PaymentStatus,
 )
 from invoiceflow.pipeline import Pipeline
 from invoiceflow.prompts import Tag
@@ -66,7 +70,7 @@ def test_acceptance(pipeline, filename, expected, expected_codes):
     found = {i.code for i in result.validation.issues}
     assert expected_codes <= found
     if expected == FinalStatus.PAID:
-        assert result.payment is not None and result.payment.status == "success"
+        assert result.payment is not None and result.payment.status == PaymentStatus.SUCCESS
     else:
         assert result.payment is None
 
@@ -148,6 +152,55 @@ def test_hard_rules_outrank_a_rogue_approver(settings, db, ground_truth, verdict
     assert state["decision"].status == ApprovalStatus.REJECTED
     assert state["final_status"] == FinalStatus.REJECTED
     assert "payment" not in state
+
+
+class TotallessRogue(RogueApprover):
+    """A document whose total did not survive extraction, in front of an agent
+    that approves anyway — proves must_review is enforced by the graph."""
+
+    def with_structured_output(self, schema, **kwargs):
+        from langchain_core.runnables import RunnableLambda
+
+        inner = super().with_structured_output(schema, **kwargs)
+        if schema is Invoice:
+            return RunnableLambda(lambda p: inner.invoke(p).model_copy(update={"total": None}))
+        return inner
+
+
+def test_missing_total_goes_to_a_human_and_is_never_paid(settings, db, ground_truth):
+    graph = build_graph(settings, db, TotallessRogue(extractions=ground_truth))
+    state = graph.invoke(
+        {
+            "source_file_path": str(INVOICES_DIR / "invoice_1001.txt"),  # otherwise paid
+            "run_id": "no-total-test",
+            "started_at": "",
+            "trace": [],
+            "critique_rounds": [],
+        }
+    )
+    assert state["final_status"] == FinalStatus.NEEDS_REVIEW
+    assert state["decision"].status == ApprovalStatus.NEEDS_REVIEW
+    assert "payment" not in state  # never reached the payer, so never $0.00
+    assert any(e.event == "hard_rule_review" for e in state["trace"])
+
+
+def test_review_outranks_rejection_end_to_end(settings, db, ground_truth):
+    """A fraud marking *and* an unestablished fact: the human confirms the fraud
+    rather than the pipeline rejecting on evidence it could not fully check."""
+    graph = build_graph(settings, db, TotallessRogue(extractions=ground_truth))
+    state = graph.invoke(
+        {
+            "source_file_path": str(INVOICES_DIR / "invoice_1003.txt"),  # fraud: zero-stock item
+            "run_id": "fraud-no-total-test",
+            "started_at": "",
+            "trace": [],
+            "critique_rounds": [],
+        }
+    )
+    assert state["constraints"].must_reject  # the fraud marking still stands
+    assert state["final_status"] == FinalStatus.NEEDS_REVIEW  # but a person confirms it
+    assert "payment" not in state
+    assert any("out_of_stock" in r for r in state["constraints"].reject_reasons)
 
 
 class EscalatingCritic(FakeBrain):

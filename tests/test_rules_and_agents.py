@@ -51,6 +51,32 @@ class TestRuleEngine:
         assert not c.must_reject
         assert any("untrusted data" in r for r in c.scrutiny_reasons)
 
+    def test_missing_total_forces_review(self):
+        report = make_report(critical(IssueCode.MISSING_TOTAL, "no total extracted"))
+        c = evaluate_rules(make_invoice(total=None), report, 10_000)
+        assert c.must_review  # outranks the must_reject it also sets
+        assert c.must_reject  # critical: nothing can proceed without a total
+        assert c.outcome_is_forced
+        assert any("a human must read" in r for r in c.review_reasons)
+
+    def test_review_outranks_rejection_when_both_apply(self):
+        # A fraud marking alongside a fact that could not be established: the
+        # accusation is exactly what a person should confirm before it stands.
+        report = make_report(
+            critical(IssueCode.OUT_OF_STOCK, "zero stock"),
+            critical(IssueCode.MISSING_TOTAL, "no total extracted"),
+        )
+        c = evaluate_rules(make_invoice(total=None), report, 10_000)
+        assert c.must_reject and c.must_review
+        assert any("zero stock" in r for r in c.reject_reasons)
+
+    def test_missing_total_cannot_skip_the_scrutiny_gate(self):
+        # The threshold below is guarded on `total is not None`, so an unknown
+        # amount must not buy a quieter path than a large one.
+        c = evaluate_rules(make_invoice(total=None), make_report(), 10_000)
+        assert c.requires_scrutiny
+        assert any("no total" in r for r in c.scrutiny_reasons)
+
     def test_scrutiny_threshold(self):
         c = evaluate_rules(make_invoice(total=10_001.0), make_report(), 10_000)
         assert c.requires_scrutiny

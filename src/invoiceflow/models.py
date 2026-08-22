@@ -32,6 +32,7 @@ class IssueCode(StrEnum):
     NEGATIVE_QUANTITY = "negative_quantity"
     NEGATIVE_AMOUNT = "negative_amount"
     MISSING_VENDOR = "missing_vendor"
+    MISSING_TOTAL = "missing_total"
     MISSING_DUE_DATE = "missing_due_date"
     SUSPICIOUS_DUE_DATE = "suspicious_due_date"
     UNEXPECTED_CURRENCY = "unexpected_currency"
@@ -223,8 +224,18 @@ class CritiqueRound(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class PaymentStatus(StrEnum):
+    """The outcomes the payer can produce. Only these two exist: the mock bank
+    reports success, and the idempotency guard refuses an already-paid invoice.
+    Typing the field makes `PaymentResult(status=...)` the validation boundary
+    for whatever the banking API hands back."""
+
+    SUCCESS = "success"
+    SKIPPED_ALREADY_PAID = "skipped_already_paid"
+
+
 class PaymentResult(BaseModel):
-    status: str
+    status: PaymentStatus
     vendor: str
     amount: float
     reference: str = ""
@@ -252,3 +263,7 @@ class InvoiceRunResult(BaseModel):
     payment: PaymentResult | None = None
     error: str = ""
     trace: list[TraceEvent] = Field(default_factory=list)
+    # Set when a person acts on the run in the dashboard — overturning it or
+    # confirming it as it stands. Empty means no human has looked at it yet,
+    # which is what lets the UI count outstanding auto-rejections.
+    human_reviewed_at: str = ""

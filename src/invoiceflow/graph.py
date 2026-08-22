@@ -25,6 +25,7 @@ from .models import (
     CritiqueRound,
     CritiqueVerdict,
     FinalStatus,
+    PaymentStatus,
     TraceEvent,
     ValidationReport,
 )
@@ -163,9 +164,24 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
 
         updates: dict = {"critique_rounds": [CritiqueRound(decision=decision, critique=crit)]}
         # Precedence, top to bottom: hard rules outrank the Critic, which
-        # outranks the Approver. must_reject terminates the chain — no verdict
-        # below can soften it, not even an escalation to a human.
-        if constraints.must_reject:
+        # outranks the Approver. The first match terminates the chain — no
+        # verdict below can soften it, not even an escalation to a human.
+        if constraints.must_review:
+            # Outranks must_reject on purpose. A rejection is an accusation, and
+            # where the rules also say a fact could not be established, the
+            # accusation is exactly what a person should confirm before it stands.
+            if decision.status != ApprovalStatus.NEEDS_REVIEW:
+                updates["decision"] = decision.model_copy(
+                    update={
+                        "status": ApprovalStatus.NEEDS_REVIEW,
+                        "reasoning": "Hard business rule override: this invoice cannot be "
+                        "decided automatically. " + "; ".join(constraints.review_reasons),
+                    }
+                )
+                trace.append(
+                    _ev("approval", "hard_rule_review", f"{decision.status} -> needs_review")
+                )
+        elif constraints.must_reject:
             # Already what the rules demand: leave the Approver's own reasoning
             # in place, and keep `hard_rule_override` meaning what it says —
             # an agent tried to talk its way past a hard rule.
@@ -210,12 +226,12 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
         }
 
     def record(state: PipelineState) -> dict:
-        final = _final_status(state)
-        trace = [_ev("record", f"final:{final}")]
+        final_status = _final_status(state)
+        trace = [_ev("record", f"final:{final_status}")]
         invoice = state.get("invoice")
-        if invoice is not None and final not in (FinalStatus.FAILED, FinalStatus.DUPLICATE):
+        if invoice is not None and final_status not in (FinalStatus.FAILED, FinalStatus.DUPLICATE):
             prior = db.get_processed(invoice.invoice_number)
-            if prior is not None and prior.final_status == "paid" and final != FinalStatus.PAID:
+            if prior is not None and prior.final_status == "paid" and final_status != FinalStatus.PAID:
                 trace.append(
                     _ev("record", "registry_kept", f"{invoice.invoice_number} stays 'paid'")
                 )
@@ -225,13 +241,13 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
                     invoice.content_hash(),
                     invoice.vendor,
                     invoice.total,
-                    final.value,
+                    final_status.value,
                     state["run_id"],
                 )
                 trace.append(
-                    _ev("record", "registry_updated", f"{invoice.invoice_number} -> {final}")
+                    _ev("record", "registry_updated", f"{invoice.invoice_number} -> {final_status}")
                 )
-        return {"final_status": final, "trace": trace}
+        return {"final_status": final_status, "trace": trace}
 
     # -- routing ------------------------------------------------------------
 
@@ -249,15 +265,18 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
         verdict = rounds[-1].critique.verdict
         if (
             verdict == CritiqueVerdict.REVISE
-            # A hard rejection is already settled: another Approver round could
-            # only reword a decision the rules have decided.
-            and not constraints.must_reject
+            # A forced outcome is already settled: another Approver round could
+            # only reword a decision the rules have made.
+            and not constraints.outcome_is_forced
             and len(rounds) <= settings.max_critique_rounds
         ):
             return "decide"  # back to the Approver for another draft
-        # The invariant, stated on the one edge where money moves: a hard
-        # rejection is never paid, whatever the two agents concluded.
-        if state["decision"].status == ApprovalStatus.APPROVED and not constraints.must_reject:
+        # The invariant, stated on the one edge where money moves: an invoice
+        # the rules have decided is never paid, whatever the two agents said.
+        if (
+            state["decision"].status == ApprovalStatus.APPROVED
+            and not constraints.outcome_is_forced
+        ):
             return "pay"
         return "record"
 
@@ -304,19 +323,34 @@ def export_graph_image(compiled, out_dir: Path = DOCS_DIR) -> None:
 def _final_status(state: PipelineState) -> FinalStatus:
     if state.get("error"):
         return FinalStatus.FAILED
+
     if state.get("quarantine_reason"):
         # Never auto-rejected: deciding whether a forged fence is an attack or
         # an artifact is the one judgement no agent here is fit to make.
         return FinalStatus.NEEDS_REVIEW
+
     report = state.get("report")
     if report is not None and report.is_exact_duplicate:
         return FinalStatus.DUPLICATE
+
     payment = state.get("payment")
     if payment is not None:
-        return FinalStatus.PAID if payment.status == "success" else FinalStatus.DUPLICATE
+        # Both payer outcomes named: a status that is merely "not success" can
+        # no longer be recorded as a duplicate by default. Nothing else can
+        # reach here (PaymentStatus is validated at construction), and if it
+        # somehow did it would fall through to the decision below — needs
+        # review, never paid.
+        match payment.status:
+            case PaymentStatus.SUCCESS:
+                return FinalStatus.PAID
+            case PaymentStatus.SKIPPED_ALREADY_PAID:
+                return FinalStatus.DUPLICATE
+
     decision = state.get("decision")
     if decision is None:
         return FinalStatus.FAILED
+
     if decision.status == ApprovalStatus.REJECTED:
         return FinalStatus.REJECTED
+
     return FinalStatus.NEEDS_REVIEW

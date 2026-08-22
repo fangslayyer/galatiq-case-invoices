@@ -41,7 +41,7 @@ graph TD
     D <--> T1[(check_inventory<br/>verify_arithmetic<br/>check_integrity<br/>check_duplicate)]
     D -- exact duplicate --> H
     D --> E{{"🤖 Approver"}}
-    R[Rule engine<br/>&gt;$10K scrutiny · hard rejects] --> E
+    R[Rule engine<br/>&gt;$10K scrutiny · hard rejects · forced review] --> E
     E --> F{{"🤖 Critic<br/>fraud checklist"}}
     F -- "revise ≤2 rounds<br/>(graph cycle)" --> E
     F -- deadlock --> Q

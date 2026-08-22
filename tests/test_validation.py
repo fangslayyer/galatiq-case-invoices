@@ -113,6 +113,18 @@ class TestIntegrity:
             IssueCode.NEGATIVE_AMOUNT,
         } <= codes(ctx)
 
+    def test_missing_total_is_flagged(self, db):
+        # Every other total check is guarded by `is not None`, so an absent
+        # total would otherwise pass by leaving nothing to check.
+        ctx = ValidationContext(make_invoice(total=None), db)
+        check_integrity(ctx)
+        assert IssueCode.MISSING_TOTAL in codes(ctx)
+        assert IssueCode.NEGATIVE_AMOUNT not in codes(ctx)
+        # Breaking, not advisory — what the pipeline does about it is the rule
+        # engine's call, not this severity's.
+        missing = next(i for i in ctx.issues if i.code == IssueCode.MISSING_TOTAL)
+        assert missing.severity == Severity.CRITICAL
+
     def test_due_date_not_after_invoice_date(self, db):
         inv = make_invoice(due_date=date(2026, 1, 1))
         ctx = ValidationContext(inv, db)
