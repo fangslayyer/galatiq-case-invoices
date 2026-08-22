@@ -119,7 +119,14 @@ uv run pytest                      # 61 offline tests, ~3s, no API key needed
 uv run pytest --cov=invoiceflow    # with coverage
 uv run pytest -m live              # against real Grok (needs XAI_API_KEY)
 uv run ruff check && uv run ruff format --check
+uv run pyright                     # static types: clean, 0 errors
 ```
+
+Type checking is configured in `pyproject.toml` and passes clean, with one rule
+switched off deliberately: LangGraph nodes return *partial* state updates, so
+`PipelineState` must stay `total=False`, and which keys exist at a given node is
+guaranteed by the graph's topology rather than by the type. The keys the runner
+always supplies are marked `Required`; the rest are covered by the tests.
 
 The offline e2e suite runs every sample file through the full LangGraph
 pipeline and asserts the acceptance table above, plus registry-ordering

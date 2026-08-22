@@ -8,9 +8,11 @@ hand-rolled so every step is visible and testable.
 from __future__ import annotations
 
 import json
+from typing import cast
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from pydantic import BaseModel
 
 from . import prompts
 from .models import ApprovalDecision, Critique, Invoice, ValidationReport, ValidatorSummary
@@ -20,6 +22,20 @@ from .validation import ALL_CHECKS, ValidationContext, build_tools
 
 class ExtractionError(RuntimeError):
     """Raised when the Extractor cannot produce a usable invoice after retries."""
+
+
+def _ask[SchemaT: BaseModel](
+    llm: BaseChatModel, schema: type[SchemaT], messages: list[BaseMessage]
+) -> SchemaT:
+    """Invoke `llm` bound to `schema` and hand back that model.
+
+    LangChain declares `with_structured_output` as returning `dict | BaseModel`
+    because a raw dict is possible under other flags; with a Pydantic schema and
+    the defaults we use, the runtime value is always an instance of `schema`.
+    Narrowing it here keeps that assumption in one auditable place instead of
+    spreading it across every agent.
+    """
+    return cast(SchemaT, llm.with_structured_output(schema).invoke(messages))
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +69,6 @@ def run_extractor(
 ) -> tuple[Invoice, int]:
     """Extract with a self-correction loop: schema/sanity failures are fed
     back to the agent verbatim. Returns (invoice, retries_used)."""
-    structured = llm.with_structured_output(Invoice)
     system = SystemMessage(EXTRACTOR_SYSTEM.format(catalog=", ".join(catalog)))
     feedback: list[str] = []
     last_error = ""
@@ -64,7 +79,7 @@ def run_extractor(
                 prompts.ERRORS_TAG, "\n".join(feedback)
             )
         try:
-            invoice = structured.invoke([system, HumanMessage(human)])
+            invoice = _ask(llm, Invoice, [system, HumanMessage(human)])
             problems = _sanity_check(invoice)
             if not problems:
                 return invoice, attempt
@@ -127,7 +142,9 @@ def run_validator(llm: BaseChatModel, ctx: ValidationContext) -> ValidationRepor
             fn(ctx)
 
     issues_json = json.dumps([i.model_dump() for i in ctx.issues], indent=2)
-    summary = llm.with_structured_output(ValidatorSummary).invoke(
+    summary = _ask(
+        llm,
+        ValidatorSummary,
         [
             SystemMessage(
                 "Summarize the validation results for the approval stage. Add extra_issues "
@@ -138,7 +155,7 @@ def run_validator(llm: BaseChatModel, ctx: ValidationContext) -> ValidationRepor
                 + "\n"
                 + prompts.block(prompts.ISSUES_TAG, issues_json)
             ),
-        ]
+        ],
     )
     return ValidationReport(
         issues=[*ctx.issues, *summary.extra_issues],
@@ -202,9 +219,7 @@ def run_approver(
         human += "\n\nThe Critic rejected your previous decision — address this:\n" + prompts.block(
             prompts.FEEDBACK_TAG, critic_feedback
         )
-    return llm.with_structured_output(ApprovalDecision).invoke(
-        [SystemMessage(APPROVER_SYSTEM), HumanMessage(human)]
-    )
+    return _ask(llm, ApprovalDecision, [SystemMessage(APPROVER_SYSTEM), HumanMessage(human)])
 
 
 def run_critic(
@@ -220,6 +235,4 @@ def run_critic(
         + "\n"
         + _decision_context(invoice, report, constraints)
     )
-    return llm.with_structured_output(Critique).invoke(
-        [SystemMessage(CRITIC_SYSTEM), HumanMessage(human)]
-    )
+    return _ask(llm, Critique, [SystemMessage(CRITIC_SYSTEM), HumanMessage(human)])

@@ -51,19 +51,26 @@ def save(result: InvoiceRunResult) -> None:
 
 
 def resolve(result: InvoiceRunResult, approve: bool, reviewer_note: str) -> None:
+    inv, decision = result.invoice, result.decision
+    if inv is None or decision is None:
+        # Only needs_review runs reach the queue, and those always carry both —
+        # but this button writes to the payment registry, so check locally
+        # rather than trusting an invariant enforced two modules away.
+        st.error("This run has no extracted invoice or decision to act on.")
+        return
+
     stamp = datetime.now(UTC).isoformat(timespec="seconds")
     if approve:
-        result.payment = execute_payment(db, result.invoice, result.run_id)
+        result.payment = execute_payment(db, inv, result.run_id)
         result.final_status = (
             FinalStatus.PAID if result.payment.status == "success" else FinalStatus.DUPLICATE
         )
     else:
         result.final_status = FinalStatus.REJECTED
     verdict = "approved and paid" if approve else "rejected"
-    result.decision.reasoning += f"\n\nHuman override at {stamp}: {verdict}." + (
+    decision.reasoning += f"\n\nHuman override at {stamp}: {verdict}." + (
         f" Note: {reviewer_note}" if reviewer_note else ""
     )
-    inv = result.invoice
     db.record_processed(
         inv.invoice_number,
         inv.content_hash(),

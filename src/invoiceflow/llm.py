@@ -8,6 +8,7 @@ inject a fake chat model instead.
 from __future__ import annotations
 
 from langchain_core.language_models import BaseChatModel
+from pydantic import SecretStr
 
 from .config import Settings
 
@@ -25,4 +26,4 @@ def build_llm(settings: Settings) -> BaseChatModel:
         )
     from langchain_xai import ChatXAI
 
-    return ChatXAI(model=settings.grok_model, api_key=api_key, temperature=0)
+    return ChatXAI(model=settings.grok_model, api_key=SecretStr(api_key), temperature=0)

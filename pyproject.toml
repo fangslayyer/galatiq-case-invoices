@@ -21,6 +21,7 @@ dependencies = [
 dev = [
     "ipykernel>=7.3.0",
     "jupyterlab>=4.6.3",
+    "pyright>=1.1.411",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
     "ruff>=0.16.4",
@@ -43,6 +44,8 @@ addopts = "-m 'not live'"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# The case brief is provided material, not our source — never reformat it.
+exclude = ["docs"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
@@ -51,4 +54,15 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 # typer's Option-in-default is the framework's own idiom
 "src/invoiceflow/cli.py" = ["B008"]
 
-[tool.ruff] exclude = ["docs"]
+[tool.pyright]
+include = ["src", "tests", "ui", "main.py"]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+# LangGraph state is partial by construction: nodes return only the keys they
+# change, so PipelineState stays total=False. Which keys are populated at a
+# given node is guaranteed by the graph's topology (the routing functions in
+# graph.py), which no type checker can see. The keys the runner always supplies
+# are marked Required in state.py; the rest are checked by the tests instead.
+reportTypedDictNotRequiredAccess = "none"

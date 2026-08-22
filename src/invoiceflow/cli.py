@@ -26,7 +26,13 @@ STATUS_STYLE = {
     FinalStatus.FAILED: "bold magenta",
 }
 
-SEVERITY_STYLE = {Severity.CRITICAL: "red", Severity.WARNING: "yellow", Severity.INFO: "dim"}
+# Keyed by str, not Severity: trace events carry the severity as plain text
+# (Severity is a StrEnum, so the members below are valid str keys).
+SEVERITY_STYLE: dict[str, str] = {
+    Severity.CRITICAL: "red",
+    Severity.WARNING: "yellow",
+    Severity.INFO: "dim",
+}
 
 
 @app.command()
@@ -68,7 +74,15 @@ def main(
         )
         raise typer.Exit(1)
 
-    if not (invoice_path or process_all):
+    if process_all:
+        paths = sorted(
+            p
+            for p in (PROJECT_ROOT / "data" / "invoices").iterdir()
+            if p.suffix.lower() in SUPPORTED_EXTENSIONS
+        )
+    elif invoice_path is not None:
+        paths = [invoice_path]
+    else:
         console.print("Nothing to do: pass [bold]--invoice_path FILE[/bold] or [bold]--all[/bold].")
         raise typer.Exit(1)
 
@@ -86,15 +100,6 @@ def main(
             f"[dim]LangSmith tracing:[/dim] [bold]{project}[/bold] "
             "[dim](development only — prompts and invoice text leave the machine)[/dim]"
         )
-
-    if process_all:
-        paths = sorted(
-            p
-            for p in (PROJECT_ROOT / "data" / "invoices").iterdir()
-            if p.suffix.lower() in SUPPORTED_EXTENSIONS
-        )
-    else:
-        paths = [invoice_path]
 
     results = []
     for path in paths:
