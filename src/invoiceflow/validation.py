@@ -106,7 +106,8 @@ def check_inventory(ctx: ValidationContext) -> None:
             ctx.add_issue(
                 IssueCode.STOCK_EXCEEDED,
                 Severity.CRITICAL,
-                f"'{item}' total ordered quantity {invoice_qty} exceeds available stock {record.stock}",
+                f"'{item}' total ordered quantity {invoice_qty} "
+                f"exceeds available stock {record.stock}",
             )
 
 
@@ -147,7 +148,8 @@ def verify_arithmetic(ctx: ValidationContext) -> None:
             ctx.add_issue(
                 IssueCode.TOTAL_MISMATCH,
                 Severity.WARNING,
-                f"stated total {invoice.total:.2f} != subtotal + tax + charges = {expected_total:.2f}",
+                f"stated total {invoice.total:.2f} != "
+                f"subtotal + tax + charges = {expected_total:.2f}",
             )
 
 
@@ -183,7 +185,9 @@ def check_integrity(ctx: ValidationContext) -> None:
         )
     elif invoice.total < 0:
         ctx.add_issue(
-            IssueCode.NEGATIVE_AMOUNT, Severity.CRITICAL, f"total amount is negative ({invoice.total})"
+            IssueCode.NEGATIVE_AMOUNT,
+            Severity.CRITICAL,
+            f"total amount is negative ({invoice.total})",
         )
 
     if invoice.due_date is None:

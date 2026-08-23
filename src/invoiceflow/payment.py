@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from .db import Database
-from .models import Invoice, PaymentResult, PaymentStatus
+from .models import FinalStatus, Invoice, PaymentResult, PaymentStatus
 
 log = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ def execute_payment(db: Database, invoice: Invoice, run_id: str) -> PaymentResul
             f"{invoice.invoice_number} has no total amount; it must never reach payment"
         )
     prior = db.get_processed(invoice.invoice_number)
-    if prior is not None and prior.final_status == "paid":
+    if prior is not None and prior.final_status == FinalStatus.PAID:
         log.warning("Refusing to double-pay %s (already paid)", invoice.invoice_number)
         return PaymentResult(
             status=PaymentStatus.SKIPPED_ALREADY_PAID,

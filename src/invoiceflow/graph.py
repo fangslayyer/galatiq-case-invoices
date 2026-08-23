@@ -231,7 +231,12 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
         invoice = state.get("invoice")
         if invoice is not None and final_status not in (FinalStatus.FAILED, FinalStatus.DUPLICATE):
             prior = db.get_processed(invoice.invoice_number)
-            if prior is not None and prior.final_status == "paid" and final_status != FinalStatus.PAID:
+            keeps_paid = (
+                prior is not None
+                and prior.final_status == FinalStatus.PAID
+                and final_status != FinalStatus.PAID
+            )
+            if keeps_paid:
                 trace.append(
                     _ev("record", "registry_kept", f"{invoice.invoice_number} stays 'paid'")
                 )
@@ -294,30 +299,35 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
     graph.add_conditional_edges("critique", after_critique, ["decide", "pay", "record"])
     graph.add_edge("pay", "record")
     graph.add_edge("record", END)
-    compiled = graph.compile()
-    export_graph_image(compiled)
-    return compiled
+    return graph.compile()
 
 
-def export_graph_image(compiled, out_dir: Path = DOCS_DIR) -> None:
+def export_graph_image(compiled, out_dir: Path = DOCS_DIR) -> bool:
     """Render the compiled graph to docs/graph.png (mermaid source alongside it).
 
-    The PNG is rendered by mermaid.ink, so it is only re-fetched when the graph
-    topology actually changed, and a failure (offline, service down) is logged
-    rather than raised: a missing diagram must never break a pipeline run.
+    Manual step, never part of a run: the PNG is rendered by mermaid.ink, and
+    the case allows no external API but Grok. `--export-graph` is the only
+    caller; `test_graph_diagram_is_current` catches a stale committed diagram
+    offline, by comparing the mermaid source rather than fetching anything.
+
+    Returns True when a new diagram was written, False when the committed one
+    was already current. Rendering failures raise: this runs only because
+    somebody asked for it, so reporting success on a silent no-op would be
+    worse than the traceback — the caller decides how loudly to fail.
     """
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        drawable = compiled.get_graph()
-        mermaid = drawable.draw_mermaid()
-        mmd_path, png_path = out_dir / "graph.mmd", out_dir / "graph.png"
-        if png_path.exists() and mmd_path.exists() and mmd_path.read_text() == mermaid:
-            return
-        mmd_path.write_text(mermaid)
-        png_path.write_bytes(drawable.draw_mermaid_png())
-        log.info("graph diagram written to %s", png_path)
-    except Exception as exc:  # diagram export is best-effort, never fatal
-        log.warning("graph diagram export skipped: %s", exc)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    drawable = compiled.get_graph()
+    mermaid = drawable.draw_mermaid()
+    mmd_path, png_path = out_dir / "graph.mmd", out_dir / "graph.png"
+    if png_path.exists() and mmd_path.exists() and mmd_path.read_text() == mermaid:
+        return False
+    # PNG first: it is the step that can fail, and a written .mmd with a stale
+    # .png would leave test_graph_diagram passing over a lying picture.
+    png = drawable.draw_mermaid_png()
+    png_path.write_bytes(png)
+    mmd_path.write_text(mermaid)
+    log.info("graph diagram written to %s", png_path)
+    return True
 
 
 def _final_status(state: PipelineState) -> FinalStatus:

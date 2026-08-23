@@ -18,6 +18,7 @@ uv run python main.py --init-db                            # create + seed inven
 uv run python main.py --invoice_path=data/invoices/invoice_1001.txt
 uv run python main.py --all                                # batch: all 20 sample files
 uv run streamlit run ui/app.py                             # review dashboard
+uv run python main.py --export-graph                       # re-render docs/graph.png
 ```
 
 Grok is the pipeline's only brain — there is deliberately no rule-based
@@ -66,17 +67,20 @@ The Approver ↔ Critic revision arrow is the opposite: a real conditional edge
 routing `critique` back to `decide` (the node the Approver runs in). Both are
 called self-correction loops below; only one is a LangGraph edge.
 
-The graph LangGraph *actually* compiles is exported on every `build_graph()`
-call, so the picture can never drift from the code (mermaid source alongside it
-in [docs/graph.mmd](docs/graph.mmd)) — note it has no self-edge on `ingest`,
-and the `decide`/`critique` cycle is right there:
+The picture below is the graph LangGraph *actually* compiles. Rendering it goes
+through mermaid.ink, so it is a deliberate manual step (`--export-graph`) rather
+than a side effect of every run — the brief allows no external API but Grok.
+Drift is caught offline instead: `test_graph_diagram` compares the committed
+mermaid source ([docs/graph.mmd](docs/graph.mmd)) against the topology as
+compiled today, and fails if the diagram was not re-exported. Note it has no
+self-edge on `ingest`, and the `decide`/`critique` cycle is right there:
 
 <img src="docs/graph.png" alt="Compiled LangGraph topology" width="200">
 
 | Agent | Role | Agentic pattern |
 |---|---|---|
 | **Extractor** | Messy text → structured `Invoice` (canonical item names, OCR fixes) | Self-correction loop #1, **in-agent**: schema/sanity errors fed back into the next prompt, ≤2 retries |
-| **Validator** | Interrogates the invoice against inventory & records | ReAct tool-calling loop over 4 deterministic tools |
+| **Validator** | Interrogates the invoice against inventory & records | ReAct tool-calling loop over 5 deterministic tools |
 | **Approver** | Drafts approve / reject / needs-review with business rationale | Proposer in a reflection pair |
 | **Critic** | Adversarial audit against a fraud & scrutiny checklist | Self-correction loop #2, **a graph cycle**: can force revisions or escalate to a human |
 | **Payer** | Executes the mock payment or logs the rejection | Guarded tool execution (never pays twice) |
@@ -135,7 +139,7 @@ and the `decide`/`critique` cycle is right there:
 ## Testing & quality
 
 ```bash
-uv run pytest                      # 61 offline tests, ~3s, no API key needed
+uv run pytest                      # 110 offline tests, ~7s, no API key needed
 uv run pytest --cov=invoiceflow    # with coverage
 uv run pytest -m live              # against real Grok (needs XAI_API_KEY)
 uv run ruff check && uv run ruff format --check
@@ -182,7 +186,7 @@ LANGSMITH_PROJECT=invoiceflow
 
 Runs are named per invoice and tagged with the model, the CLI prints a banner
 whenever tracing is live, and the test suite forces it off
-(`tests/__init__.py`) so 61 fake-brain runs never land in a real project. The
+(`tests/__init__.py`) so 110 fake-brain runs never land in a real project. The
 banner reads the same four environment variables the tracer itself does
 (`config.TRACING_ENV_VARS`), so a traced run can never look untraced.
 
@@ -200,9 +204,9 @@ src/invoiceflow/
   pipeline.py            run wrapper: Grok factory, run IDs, timing, JSON results
   cli.py                 rich terminal UI: per-stage trace, batch summary
 ui/app.py                Streamlit dashboard: runs browser + escalation queue
-tests/                   65 tests (61 offline + 4 live-marked)
+tests/                   114 tests (110 offline + 4 live-marked)
 data/invoices/           provided sample invoices (the acceptance dataset)
-docs/graph.png|.mmd      compiled LangGraph topology, re-exported by build_graph()
+docs/graph.png|.mmd      compiled LangGraph topology (`--export-graph` re-renders)
 ```
 
 ## Business impact

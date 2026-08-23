@@ -47,6 +47,11 @@ def main(
     reset_db: bool = typer.Option(
         False, "--reset-db", help="Drop and recreate the inventory DB and processed registry"
     ),
+    export_graph: bool = typer.Option(
+        False,
+        "--export-graph",
+        help="Re-render docs/graph.png from the compiled topology (fetches mermaid.ink)",
+    ),
     model: str | None = typer.Option(None, "--model", help="Grok model name (default: grok-4.6)"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show internal logs"),
 ) -> None:
@@ -57,6 +62,11 @@ def main(
     )
     settings = Settings(grok_model=model) if model else Settings()
     db = Database(settings.db_path)
+
+    if export_graph:
+        _export_graph(settings, db)
+        if not (invoice_path or process_all):
+            return
 
     if init_db or reset_db:
         db.init(reset=reset_db)
@@ -176,6 +186,28 @@ def _render_summary(results: list[InvoiceRunResult]) -> None:
         f"[{STATUS_STYLE[s]}]{s}: {n}[/{STATUS_STYLE[s]}]" for s, n in sorted(counts.items())
     )
     console.print(f"\n{len(results)} invoice(s) processed → {tally}")
+
+
+def _export_graph(settings: Settings, db: Database) -> None:
+    """Re-render docs/graph.png on demand — the only caller of the exporter.
+
+    Deliberately not part of a run: rendering goes to mermaid.ink, and the case
+    allows no external API but Grok. The topology does not depend on the model,
+    so this needs no API key — any BaseChatModel compiles the same graph.
+    """
+    from langchain_core.language_models import FakeListChatModel
+
+    from .graph import build_graph, export_graph_image
+
+    try:
+        written = export_graph_image(build_graph(settings, db, FakeListChatModel(responses=[])))
+    except Exception as exc:  # mermaid.ink unreachable, render error, unwritable docs/
+        console.print(f"[red]Graph export failed:[/red] {exc}")
+        raise typer.Exit(1) from None
+    if written:
+        console.print("[green]✓[/green] Graph diagram exported to [bold]docs/graph.png[/bold]")
+    else:
+        console.print("[dim]Graph diagram already matches the compiled topology.[/dim]")
 
 
 def _money(total: float | None, currency: str = "USD") -> str:
