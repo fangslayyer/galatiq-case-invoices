@@ -126,7 +126,7 @@ class RogueApprover(FakeBrain):
     `critic_verdict` chooses what the Critic answers, so the guard can be held
     against every verdict rather than only the one that happens to agree."""
 
-    critic_verdict: CritiqueVerdict = CritiqueVerdict.ACCEPT
+    critic_verdict: CritiqueVerdict = CritiqueVerdict.AFFIRM
 
     def with_structured_output(self, schema, **kwargs):
         from langchain_core.runnables import RunnableLambda
@@ -189,6 +189,58 @@ def test_missing_total_goes_to_a_human_and_is_never_paid(settings, db, store, gr
     assert state["final_status"] == FinalStatus.NEEDS_REVIEW
     assert state["decision"].status == ApprovalStatus.NEEDS_REVIEW
     assert "payment" not in state  # never reached the payer, so never $0.00
+    assert any(e.event == "hard_rule_review" for e in state["trace"])
+
+
+@pytest.mark.parametrize("verdict", list(CritiqueVerdict))
+def test_unknown_item_goes_to_a_human_and_is_never_paid(settings, db, store, ground_truth, verdict):
+    """INV-1016, the real regression: a 'WidgetC' that no catalog has ever held,
+    in front of the agents that actually paid it — an Approver that calls the
+    gap a new SKU and a Critic that agrees. The acceptance suite could not
+    catch this, because its fake Approver escalates on any advisory warning;
+    the rule engine did not, so only the fake was holding the line."""
+    graph = build_graph(
+        settings, db, store, RogueApprover(extractions=ground_truth, critic_verdict=verdict)
+    )
+    state = graph.invoke(
+        {
+            "source_file_path": str(INVOICES_DIR / "invoice_1016.json"),
+            "run_id": f"unknown-item-test-{verdict}",
+            "started_at": "",
+            "trace": [],
+            "critique_rounds": [],
+        }
+    )
+    assert state["final_status"] == FinalStatus.NEEDS_REVIEW
+    assert state["decision"].status == ApprovalStatus.NEEDS_REVIEW
+    assert "payment" not in state
+    assert any(e.event == "hard_rule_review" for e in state["trace"])
+    # The reviewer is told which item, not merely that one was unknown.
+    assert "WidgetC" in state["decision"].reasoning
+
+
+@pytest.mark.parametrize("verdict", list(CritiqueVerdict))
+def test_foreign_currency_goes_to_a_human_and_is_never_paid(
+    settings, db, store, ground_truth, verdict
+):
+    """INV-1014 is billed in EUR. The acceptance suite always expected a human
+    to see it, but only the fake Approver was enforcing that — in production it
+    was paid. Held here against an Approver that approves regardless."""
+    graph = build_graph(
+        settings, db, store, RogueApprover(extractions=ground_truth, critic_verdict=verdict)
+    )
+    state = graph.invoke(
+        {
+            "source_file_path": str(INVOICES_DIR / "invoice_1014.xml"),
+            "run_id": f"currency-test-{verdict}",
+            "started_at": "",
+            "trace": [],
+            "critique_rounds": [],
+        }
+    )
+    assert state["final_status"] == FinalStatus.NEEDS_REVIEW
+    assert state["decision"].status == ApprovalStatus.NEEDS_REVIEW
+    assert "payment" not in state  # never paid a EUR sum as though it were USD
     assert any(e.event == "hard_rule_review" for e in state["trace"])
 
 

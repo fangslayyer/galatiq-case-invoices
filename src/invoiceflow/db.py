@@ -13,19 +13,25 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-SEED_INVENTORY: list[tuple[str, int, float]] = [
-    # (item, stock, unit_price) — from the case brief, plus catalog prices
-    ("WidgetA", 15, 250.00),
-    ("WidgetB", 10, 500.00),
-    ("GadgetX", 5, 750.00),
-    ("FakeItem", 0, 1000.00),
+SEED_INVENTORY: list[tuple[str, int]] = [
+    # (item, stock) — exactly the case brief's seed data, and deliberately no
+    # more. The brief does permit a unit_price column, but a legacy stock
+    # system was never handed purchase-order prices, and the only numbers
+    # available to seed one from are the sample invoices' own line items. A
+    # catalog whose prices are derived from the documents it audits cannot
+    # tell a negotiated discount from an overcharge; it would lend invented
+    # figures the authority of a reference, which is worse than holding no
+    # prices at all. What we cannot source, we do not claim to know.
+    ("WidgetA", 15),
+    ("WidgetB", 10),
+    ("GadgetX", 5),
+    ("FakeItem", 0),
 ]
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS inventory (
     item TEXT PRIMARY KEY,
-    stock INTEGER NOT NULL,
-    unit_price REAL
+    stock INTEGER NOT NULL
 );
 """
 
@@ -34,7 +40,6 @@ CREATE TABLE IF NOT EXISTS inventory (
 class InventoryRecord:
     item: str
     stock: int
-    unit_price: float | None
 
 
 class Database:
@@ -54,7 +59,7 @@ class Database:
                 conn.execute("DROP TABLE IF EXISTS processed_invoices")
             conn.executescript(SCHEMA)
             conn.executemany(
-                "INSERT OR IGNORE INTO inventory (item, stock, unit_price) VALUES (?, ?, ?)",
+                "INSERT OR IGNORE INTO inventory (item, stock) VALUES (?, ?)",
                 SEED_INVENTORY,
             )
 
@@ -63,14 +68,14 @@ class Database:
     def get_item(self, item: str) -> InventoryRecord | None:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT item, stock, unit_price FROM inventory WHERE item = ? COLLATE NOCASE",
+                "SELECT item, stock FROM inventory WHERE item = ? COLLATE NOCASE",
                 (item,),
             ).fetchone()
         if row is None:
             return None
-        return InventoryRecord(row["item"], row["stock"], row["unit_price"])
+        return InventoryRecord(row["item"], row["stock"])
 
     def all_items(self) -> list[InventoryRecord]:
         with self.connect() as conn:
-            rows = conn.execute("SELECT item, stock, unit_price FROM inventory").fetchall()
-        return [InventoryRecord(r["item"], r["stock"], r["unit_price"]) for r in rows]
+            rows = conn.execute("SELECT item, stock FROM inventory").fetchall()
+        return [InventoryRecord(r["item"], r["stock"]) for r in rows]

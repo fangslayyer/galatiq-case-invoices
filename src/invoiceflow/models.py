@@ -217,7 +217,15 @@ class ApprovalDecision(BaseModel):
 
 
 class CritiqueVerdict(StrEnum):
-    ACCEPT = "accept"
+    """What the Critic concluded about the *Approver's decision*.
+
+    Every member judges the decision, never the invoice: AFFIRM on a rejection
+    means the rejection was right, not that the invoice is good. Named `affirm`
+    rather than `accept` for exactly that reason — an "accepted" invoice is the
+    one thing this enum never means.
+    """
+
+    AFFIRM = "affirm"
     REVISE = "revise"
     ESCALATE = "escalate"
 

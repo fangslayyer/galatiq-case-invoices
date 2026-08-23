@@ -84,7 +84,7 @@ def main(
             f"[green]✓[/green] Inventory database ready at [bold]{settings.db_path}[/bold]"
         )
         for rec in db.all_items():
-            console.print(f"   {rec.item}: {rec.stock} in stock @ ${rec.unit_price:,.2f}")
+            console.print(f"   {rec.item}: {rec.stock} in stock")
         console.print(f"[green]✓[/green] Run store ready at [bold]{settings.runs_db_path}[/bold]")
         if not (invoice_path or process_all):
             return

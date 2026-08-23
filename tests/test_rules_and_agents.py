@@ -27,7 +27,7 @@ def critical(code=IssueCode.STOCK_EXCEEDED, detail="stock exceeded"):
     return ValidationIssue(code=code, severity=Severity.CRITICAL, detail=detail)
 
 
-def warning(code=IssueCode.UNKNOWN_ITEM, detail="unknown item"):
+def warning(code=IssueCode.SUSPICIOUS_DUE_DATE, detail="due date precedes invoice date"):
     return ValidationIssue(code=code, severity=Severity.WARNING, detail=detail)
 
 
@@ -40,7 +40,47 @@ class TestRuleEngine:
     def test_warnings_are_advisory(self):
         c = evaluate_rules(make_invoice(), make_report(warning()), 10_000)
         assert not c.must_reject
+        assert not c.must_review
+        assert not c.outcome_is_forced  # the agent genuinely weighs this one
         assert c.advisory_warnings
+
+    def test_unknown_item_forces_review(self):
+        # Regression, INV-1016: the invoice billed for a 'WidgetC' the catalog
+        # has never held, the check found it, and it was paid anyway because a
+        # warning was all the agent had to overrule. Not a rejection — the SKU
+        # may be genuinely new — but never the pipeline's call to make alone.
+        report = make_report(
+            warning(IssueCode.UNKNOWN_ITEM, "'WidgetC' is not in the inventory database")
+        )
+        c = evaluate_rules(make_invoice(total=3_233.0), report, 10_000)
+        assert c.must_review
+        assert not c.must_reject  # an unverifiable item is not yet an accusation
+        assert c.outcome_is_forced  # so no critique round can pay it
+        assert any("WidgetC" in r for r in c.review_reasons)
+
+    def test_unexpected_currency_forces_review(self):
+        # INV-1014: what we owe is the invoiced sum times a rate no part of this
+        # pipeline holds, so the amount itself is unestablished — the same shape
+        # of gap as a missing total, and settled the same way.
+        report = make_report(
+            warning(IssueCode.UNEXPECTED_CURRENCY, "invoice currency is EUR, expected USD")
+        )
+        c = evaluate_rules(make_invoice(total=4_125.0), report, 10_000)
+        assert c.must_review
+        assert not c.must_reject
+        assert any("exchange rate" in r for r in c.review_reasons)
+
+    def test_every_unknown_item_reaches_the_reviewer_by_name(self):
+        # INV-1008 carries two. A reviewer who is told only "an unknown item"
+        # has to re-derive which ones, so each finding keeps its own reason.
+        report = make_report(
+            warning(IssueCode.UNKNOWN_ITEM, "'SuperGizmo' is not in the inventory database"),
+            warning(IssueCode.UNKNOWN_ITEM, "'MegaSprocket' is not in the inventory database"),
+        )
+        c = evaluate_rules(make_invoice(total=9_900.0), report, 10_000)
+        assert len(c.review_reasons) == 2
+        assert any("SuperGizmo" in r for r in c.review_reasons)
+        assert any("MegaSprocket" in r for r in c.review_reasons)
 
     def test_injection_attempt_forces_scrutiny(self):
         # A warning that is *not* left to the agent's discretion: its own
@@ -121,11 +161,11 @@ class TestApprovalAgents:
         bad = ApprovalDecision(status=ApprovalStatus.REJECTED, reasoning="I don't like it")
         assert run_critic(self.llm, inv, rep, c, bad).verdict == CritiqueVerdict.REVISE
 
-    def test_critic_accepts_consistent_decision(self):
+    def test_critic_affirms_consistent_decision(self):
         inv, rep = make_invoice(), make_report()
         c = evaluate_rules(inv, rep, 10_000)
         good = ApprovalDecision(status=ApprovalStatus.APPROVED, reasoning="all checks passed")
-        assert run_critic(self.llm, inv, rep, c, good).verdict == CritiqueVerdict.ACCEPT
+        assert run_critic(self.llm, inv, rep, c, good).verdict == CritiqueVerdict.AFFIRM
 
 
 class TestValidatorAgent:
@@ -167,6 +207,18 @@ class TestAgentIssueClamp:
         c = evaluate_rules(make_invoice(), report, 10_000)
         assert not c.must_reject
         assert c.advisory_warnings
+
+    def test_agent_cannot_force_a_hard_review(self):
+        # REVIEW_CODES keys on the issue code, so the demotion to
+        # AGENT_OBSERVATION is the only thing stopping a model from routing its
+        # own runs to a human by claiming an unknown item.
+        summary = ValidatorSummary(
+            summary="never heard of this part",
+            extra_issues=[critical(IssueCode.UNKNOWN_ITEM, "'WidgetC' looks made up")],
+        )
+        c = evaluate_rules(make_invoice(), make_report(*summary.extra_issues), 10_000)
+        assert not c.must_review
+        assert not c.outcome_is_forced
 
     def test_agent_issues_do_not_route_to_duplicate(self):
         summary = ValidatorSummary(

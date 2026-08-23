@@ -189,6 +189,6 @@ def _fake_critique(text: str) -> Critique:
             feedback="Rejection is not supported by any critical validation failure.",
         )
     return Critique(
-        verdict=CritiqueVerdict.ACCEPT,
+        verdict=CritiqueVerdict.AFFIRM,
         feedback="Decision is consistent with the validation evidence and business rules.",
     )

@@ -373,7 +373,7 @@ CREATE TABLE approver_decisions (
 CREATE TABLE critic_reviews (
     id            INTEGER PRIMARY KEY,
     invocation_id INTEGER NOT NULL UNIQUE REFERENCES agent_invocations(id) ON DELETE CASCADE,
-    verdict       TEXT    NOT NULL CHECK (verdict IN ('accept','revise','escalate')),
+    verdict       TEXT    NOT NULL CHECK (verdict IN ('affirm','revise','escalate')),
     feedback      TEXT    NOT NULL
 ) STRICT;
 
