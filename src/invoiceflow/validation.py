@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 from langchain_core.tools import BaseTool, tool
 
 from .db import Database
-from .models import Invoice, IssueCode, Severity, ValidationIssue
+from .models import FinalStatus, Invoice, IssueCode, Severity, ValidationIssue
 from .prompts import Tag
 
 if TYPE_CHECKING:
@@ -220,29 +220,70 @@ def check_integrity(ctx: ValidationContext) -> None:
         )
 
 
+def _revision_of_paid_detail(number: str, paid: float | None, claimed: float | None) -> str:
+    """State a revision as the arithmetic the reviewer actually has to settle.
+
+    "This invoice was revised" tells a person to go and look the old amount
+    up; naming the delta tells them whether they owe a balance or are owed a
+    refund, which is the whole decision.
+    """
+    if paid is None or claimed is None:
+        return (
+            f"{number} was already paid, and this revision restates the amount, but the "
+            "two totals could not be compared"
+        )
+    delta = round(claimed - paid, 2)
+    if delta > 0:
+        movement = f"${delta:,.2f} more is claimed than was paid"
+    elif delta < 0:
+        movement = f"${-delta:,.2f} less is claimed than was paid, so that much was overpaid"
+    else:
+        movement = "the total is unchanged, so the revision altered something other than the sum"
+    return (
+        f"{number} was already paid at ${paid:,.2f} and this revision states "
+        f"${claimed:,.2f}: {movement}"
+    )
+
+
 @check
 def check_duplicate(ctx: ValidationContext) -> None:
     """Compare against the processed-invoice registry: exact duplicates must
-    never be paid twice; same-number-different-content means a revision."""
+    never be paid twice; same-number-different-content means a revision, and a
+    revision of an invoice we have already paid is a reconciliation."""
     inv = ctx.invoice
     if ctx.store is None:
         return  # no registry attached — nothing to compare against
     prior = ctx.store.get_processed(inv.invoice_number)
-    if prior is not None:
-        if prior.content_hash == inv.content_hash():
-            ctx.add_issue(
-                IssueCode.DUPLICATE_INVOICE,
-                Severity.CRITICAL,
-                f"{inv.invoice_number} was already processed "
-                f"(status: {prior.final_status}) with identical content",
-            )
-        else:
-            ctx.add_issue(
-                IssueCode.REVISED_INVOICE,
-                Severity.WARNING,
-                f"{inv.invoice_number} was already processed (status: {prior.final_status}) "
-                "but the content differs — this looks like a revised invoice",
-            )
+    if prior is None:
+        return
+    if prior.content_hash == inv.content_hash():
+        ctx.add_issue(
+            IssueCode.DUPLICATE_INVOICE,
+            Severity.CRITICAL,
+            f"{inv.invoice_number} was already processed "
+            f"(status: {prior.final_status}) with identical content",
+        )
+    elif prior.final_status == FinalStatus.PAID:
+        # Money has already moved on this invoice number, so the revision
+        # cannot be settled by paying it: the options are a balance, a credit
+        # note, or a rejection, and all three are a person's call. Severity
+        # stays WARNING because the document is not itself defective — it is
+        # `REVIEW_CODES` that makes this stop, on who may decide rather than
+        # on how bad it looks.
+        ctx.add_issue(
+            IssueCode.REVISION_OF_PAID_INVOICE,
+            Severity.WARNING,
+            _revision_of_paid_detail(inv.invoice_number, prior.total, inv.total),
+        )
+    else:
+        # Nothing was paid, so a corrected invoice replacing a rejected one is
+        # the workflow working. Advisory: it is re-validated on its own merits.
+        ctx.add_issue(
+            IssueCode.REVISED_INVOICE,
+            Severity.WARNING,
+            f"{inv.invoice_number} was already processed (status: {prior.final_status}) "
+            "but the content differs — this looks like a revised invoice",
+        )
 
 
 def forged_fence_issue(raw_text: str) -> ValidationIssue | None:

@@ -302,31 +302,22 @@ def build_graph(settings: Settings, db: Database, store: RunStore, llm: BaseChat
         trace = [_ev("record", f"final:{final_status}")]
         invoice = state.get("invoice")
         if invoice is not None and final_status not in (FinalStatus.FAILED, FinalStatus.DUPLICATE):
-            prior = store.get_processed(invoice.invoice_number)
-            keeps_paid = (
-                prior is not None
-                and prior.final_status == FinalStatus.PAID
-                and final_status != FinalStatus.PAID
+            # Written mid-run on purpose — the one mutable table: payment
+            # idempotency must be visible to the very next run, not after some
+            # later persistence step.
+            written = store.record_settlement(
+                invoice.invoice_number,
+                invoice.content_hash(),
+                invoice.vendor,
+                invoice.total,
+                final_status.value,
+                state.get("run_pk"),
             )
-            if keeps_paid:
-                trace.append(
-                    _ev("record", "registry_kept", f"{invoice.invoice_number} stays 'paid'")
-                )
-            else:
-                # Written mid-run on purpose — the one mutable table: payment
-                # idempotency must be visible to the very next run, not after
-                # some later persistence step.
-                store.record_processed(
-                    invoice.invoice_number,
-                    invoice.content_hash(),
-                    invoice.vendor,
-                    invoice.total,
-                    final_status.value,
-                    state.get("run_pk"),
-                )
-                trace.append(
-                    _ev("record", "registry_updated", f"{invoice.invoice_number} -> {final_status}")
-                )
+            trace.append(
+                _ev("record", "registry_updated", f"{invoice.invoice_number} -> {final_status}")
+                if written
+                else _ev("record", "registry_kept", f"{invoice.invoice_number} stays 'paid'")
+            )
         return {"final_status": final_status, "trace": trace}
 
     # -- routing ------------------------------------------------------------
@@ -429,7 +420,17 @@ def _final_status(state: PipelineState) -> FinalStatus:
             case PaymentStatus.SUCCESS:
                 return FinalStatus.PAID
             case PaymentStatus.SKIPPED_ALREADY_PAID:
-                return FinalStatus.DUPLICATE
+                # NOT a duplicate: an exact duplicate never reaches the payer
+                # (`after_validate` records it straight away), so the only way
+                # here is a *revision* of something already paid — different
+                # content, different sum, and a balance or a refund still
+                # outstanding. `duplicate` is terminal and reaches no queue,
+                # which would settle that difference by forgetting it.
+                #
+                # Unreachable while REVISION_OF_PAID_INVOICE forces review
+                # before the `pay` edge; kept as the backstop for if it ever
+                # stops doing so.
+                return FinalStatus.NEEDS_REVIEW
 
     decision = state.get("decision")
     if decision is None:

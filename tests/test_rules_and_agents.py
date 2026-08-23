@@ -58,6 +58,31 @@ class TestRuleEngine:
         assert c.outcome_is_forced  # so no critique round can pay it
         assert any("WidgetC" in r for r in c.review_reasons)
 
+    def test_revision_of_a_paid_invoice_forces_review(self):
+        # Money has already moved under this invoice number, so the revision
+        # cannot be settled by paying it too. Releasing a balance, asking for a
+        # credit note and rejecting are all reconciliations, and all a person's.
+        report = make_report(
+            warning(
+                IssueCode.REVISION_OF_PAID_INVOICE,
+                "INV-1004 was already paid at $1,890.00 and this revision states $2,430.00",
+            )
+        )
+        c = evaluate_rules(make_invoice(total=2_430.0), report, 10_000)
+        assert c.must_review
+        assert not c.must_reject  # a genuine PO amendment is not an accusation
+        assert c.outcome_is_forced
+        assert any("reconcile the difference" in r for r in c.review_reasons)
+
+    def test_revision_of_an_unpaid_invoice_stays_advisory(self):
+        # The corrected-invoice-after-rejection path: no money moved, so the
+        # pipeline re-decides it on its merits instead of queueing a human.
+        report = make_report(warning(IssueCode.REVISED_INVOICE, "content differs"))
+        c = evaluate_rules(make_invoice(), report, 10_000)
+        assert not c.must_review
+        assert not c.outcome_is_forced
+        assert c.advisory_warnings
+
     def test_unexpected_currency_forces_review(self):
         # INV-1014: what we owe is the invoiced sum times a rate no part of this
         # pipeline holds, so the amount itself is unestablished — the same shape

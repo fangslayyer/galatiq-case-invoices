@@ -18,7 +18,7 @@ import streamlit as st
 from invoiceflow.config import Settings
 from invoiceflow.db import Database
 from invoiceflow.models import FinalStatus, InvoiceRunResult, PaymentStatus, Severity
-from invoiceflow.payment import execute_payment
+from invoiceflow.review import apply_human_review
 from invoiceflow.runstore import RunStore
 
 st.set_page_config(page_title="InvoiceFlow", page_icon="🧾", layout="wide")
@@ -51,53 +51,18 @@ if not results:
     st.stop()
 
 
-def resolve(result: InvoiceRunResult, approve: bool, reviewer_note: str) -> None:
-    """Act on a run: pay it, reject it, or confirm the status it already has.
+def resolve(result: InvoiceRunResult, approve: bool, reviewer_note: str) -> bool:
+    """Hand the click to `apply_human_review` and show what it decided.
 
-    Confirming is not a no-op — it lands a `human_reviews` row, which is how an
-    auto-rejection stops counting as something nobody has checked. The agents'
-    own reasoning is never edited; the review is its own record.
+    Everything this used to work out for itself — what to pay, what status the
+    run takes, whether the action counts as a confirmation or an override —
+    now lives in `invoiceflow.review`. This function is the button and the
+    error message; it decides nothing.
     """
-    inv, decision = result.invoice, result.decision
-    if inv is None or decision is None:
-        # Only runs carrying a decision are given buttons — but this writes to
-        # the payment registry, so check locally rather than trusting an
-        # invariant enforced two modules away.
-        st.error("This run has no extracted invoice or decision to act on.")
-        return
-
-    was = result.final_status
-    if approve:
-        payment = execute_payment(store, inv, result.run_id)
-        to_status = (
-            FinalStatus.PAID if payment.status == PaymentStatus.SUCCESS else FinalStatus.DUPLICATE
-        )
-        if result.payment is None:
-            store.add_payment(result.run_id, payment, currency=inv.currency)
-    else:
-        to_status = FinalStatus.REJECTED
-    # "confirm" when the human agreed with what the pipeline already decided,
-    # an override when they changed it — the trail says which happened.
-    # The three-way split reads better spelled out than as a nested ternary.
-    if to_status == was:  # noqa: SIM108
-        action = "confirm"
-    else:
-        action = "override_approve" if approve else "override_reject"
-    store.add_human_review(
-        result.run_id,
-        action=action,
-        from_status=was,
-        to_status=to_status,
-        note=reviewer_note,
-    )
-    store.record_processed(
-        inv.invoice_number,
-        inv.content_hash(),
-        inv.vendor,
-        inv.total,
-        to_status.value,
-        None,
-    )
+    outcome = apply_human_review(store, result, approve=approve, note=reviewer_note)
+    if not outcome.recorded:
+        st.error(outcome.message)
+    return outcome.recorded
 
 
 def render_run(result: InvoiceRunResult, *, actionable: bool = False) -> None:
@@ -141,10 +106,17 @@ def render_run(result: InvoiceRunResult, *, actionable: bool = False) -> None:
         for i, r in enumerate(result.critique_rounds, 1):
             st.markdown(f"_Critique round {i}:_ **{r.critique.verdict}** — {r.critique.feedback}")
         if result.payment is not None:
-            st.success(
-                f"Payment: {result.payment.status} — "
-                f"${result.payment.amount:,.2f} to {result.payment.vendor}"
-            )
+            # `amount` on a declined payment is what was claimed and refused,
+            # not what moved — rendering both the same way is how $5,940 that
+            # never left the bank read as a completed payment.
+            pay = result.payment
+            if pay.status == PaymentStatus.SUCCESS:
+                st.success(f"💸 Sent **${pay.amount:,.2f}** to {pay.vendor}")
+            else:
+                st.warning(
+                    f"🚫 Nothing sent to {pay.vendor} — the **${pay.amount:,.2f}** claimed "
+                    f"was declined ({pay.status.replace('_', ' ')})"
+                )
         for hr in result.human_reviews:
             st.info(
                 f"🧑 {hr.action.replace('_', ' ')} by {hr.reviewer} at {hr.reviewed_at}: "
@@ -165,11 +137,15 @@ def render_run(result: InvoiceRunResult, *, actionable: bool = False) -> None:
             st.caption(f"Reviewed by a human at {result.human_reviewed_at}")
         note = st.text_input("Reviewer note", key=f"note-{result.run_id}")
         a, b = st.columns(2)
-        if a.button(pay_label, key=f"approve-{result.run_id}", type="primary"):
-            resolve(result, approve=True, reviewer_note=note)
+        # Only rerun when the review landed: a rerun would wipe the error
+        # explaining why it did not.
+        if a.button(pay_label, key=f"approve-{result.run_id}", type="primary") and resolve(
+            result, approve=True, reviewer_note=note
+        ):
             st.rerun()
-        if b.button(reject_label, key=f"reject-{result.run_id}"):
-            resolve(result, approve=False, reviewer_note=note)
+        if b.button(reject_label, key=f"reject-{result.run_id}") and resolve(
+            result, approve=False, reviewer_note=note
+        ):
             st.rerun()
 
 
@@ -181,7 +157,7 @@ def run_header(result: InvoiceRunResult) -> str:
     )
 
 
-rejected = [r for r in results if r.final_status == FinalStatus.REJECTED]
+rejected = store.rejected_runs()
 unchecked = sum(1 for r in rejected if not r.human_reviewed_at)
 tab_queue, tab_rejected, tab_runs, tab_db = st.tabs(
     [
@@ -193,7 +169,7 @@ tab_queue, tab_rejected, tab_runs, tab_db = st.tabs(
 )
 
 with tab_queue:
-    queue = [r for r in results if r.final_status == FinalStatus.NEEDS_REVIEW]
+    queue = store.review_queue()
     if not queue:
         st.success("Queue is empty — nothing needs human review.")
     for result in queue:
@@ -224,6 +200,13 @@ with tab_runs:
     cols = st.columns(len(STATUS_BADGE))
     for col, (status, badge) in zip(cols, STATUS_BADGE.items(), strict=True):
         col.metric(badge, counts.get(status, 0))
+    sent = store.money_sent()
+    st.metric(
+        "💸 Money actually sent",
+        " · ".join(f"{cur} {amt:,.2f}" for cur, amt in sorted(sent.items())) if sent else "—",
+        help="Successful payments only. A declined payment records the sum it refused, "
+        "which is not money that moved.",
+    )
     options = {
         f"{STATUS_BADGE[r.final_status]} · "
         f"{r.invoice.invoice_number if r.invoice else '?'} · {r.run_id}": r

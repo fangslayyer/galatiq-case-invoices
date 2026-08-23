@@ -34,6 +34,7 @@ from .models import (
     LineItem,
     OverrideRecord,
     PaymentResult,
+    PaymentStatus,
     RuleReasonKind,
     Severity,
     TraceEvent,
@@ -63,6 +64,7 @@ ISSUE_CATEGORIES: dict[IssueCode, str] = {
     IssueCode.NO_LINE_ITEMS: "integrity",
     IssueCode.DUPLICATE_INVOICE: "duplicate",
     IssueCode.REVISED_INVOICE: "duplicate",
+    IssueCode.REVISION_OF_PAID_INVOICE: "duplicate",
     IssueCode.PROMPT_INJECTION_ATTEMPT: "prompt_safety",
     IssueCode.AGENT_OBSERVATION: "agent",
 }
@@ -87,6 +89,10 @@ class ProcessedRecord:
     invoice_number: str
     content_hash: str
     final_status: str
+    # What we settled at. Carried so a revision can state its own delta
+    # against it — a reviewer who is told only "this was revised" still has
+    # to go and look the amount up.
+    total: float | None = None
 
 
 class RunStore:
@@ -112,12 +118,17 @@ class RunStore:
             exists = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs'"
             ).fetchone()
-            if exists:
-                return
-            conn.execute("PRAGMA journal_mode = WAL")  # persistent, set once
-            conn.executescript(SCHEMA_PATH.read_text())
+            if not exists:
+                conn.execute("PRAGMA journal_mode = WAL")  # persistent, set once
+                conn.executescript(SCHEMA_PATH.read_text())
+            # Re-seeded on every init, not only at creation. issue_codes is a
+            # lookup table that validation_issues.code holds a live foreign key
+            # to, so a code added to the IssueCode enum has to reach databases
+            # that already exist — otherwise the first run to raise it dies on
+            # a foreign-key violation, and the failure lands on a real invoice
+            # rather than on the change that caused it.
             conn.executemany(
-                "INSERT INTO issue_codes (code, category) VALUES (?, ?)",
+                "INSERT OR IGNORE INTO issue_codes (code, category) VALUES (?, ?)",
                 [(code.value, cat) for code, cat in ISSUE_CATEGORIES.items()],
             )
 
@@ -486,13 +497,15 @@ class RunStore:
     def get_processed(self, invoice_number: str) -> ProcessedRecord | None:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT invoice_number, content_hash, final_status "
+                "SELECT invoice_number, content_hash, final_status, total "
                 "FROM invoice_registry WHERE invoice_number = ?",
                 (invoice_number,),
             ).fetchone()
         if row is None:
             return None
-        return ProcessedRecord(row["invoice_number"], row["content_hash"], row["final_status"])
+        return ProcessedRecord(
+            row["invoice_number"], row["content_hash"], row["final_status"], row["total"]
+        )
 
     def record_processed(
         self,
@@ -515,6 +528,38 @@ class RunStore:
                 (invoice_number, content_hash, vendor, total, final_status, run_pk, _now()),
             )
 
+    def record_settlement(
+        self,
+        invoice_number: str,
+        content_hash: str,
+        vendor: str,
+        total: float | None,
+        final_status: str,
+        run_pk: int | None,
+    ) -> bool:
+        """Update the registry for a finished run, unless that would forget a
+        payment. Returns whether it wrote.
+
+        A run ending in anything but `paid` never overwrites a `paid` record:
+        the registry is what `outstanding_balance` reads to decide what is
+        still owed, so downgrading it is exactly how an invoice becomes payable
+        twice.
+
+        Every caller that finishes a run goes through here rather than calling
+        `record_processed` directly. The graph and the dashboard both settle
+        invoices, and this rule living in only one of them is what let a
+        dashboard approval clear the paid flag it was meant to protect.
+        """
+        prior = self.get_processed(invoice_number)
+        if (
+            prior is not None
+            and prior.final_status == FinalStatus.PAID
+            and final_status != FinalStatus.PAID
+        ):
+            return False
+        self.record_processed(invoice_number, content_hash, vendor, total, final_status, run_pk)
+        return True
+
     # -- human review -------------------------------------------------------
 
     def add_human_review(
@@ -536,12 +581,20 @@ class RunStore:
             )
 
     def add_payment(self, run_id: str, payment: PaymentResult, currency: str = "USD") -> None:
-        """A human-authorized payment for a run the pipeline did not pay."""
+        """A human-authorized payment for a run the pipeline did not pay.
+
+        Upserts because `payments.run_id` is UNIQUE and a run can be acted on
+        twice: a refused attempt recorded as `skipped_already_paid` is replaced
+        by the real payment if a later approval succeeds.
+        """
         with self.connect() as conn:
             pk = conn.execute("SELECT id FROM runs WHERE run_id = ?", (run_id,)).fetchone()["id"]
             conn.execute(
                 "INSERT INTO payments (run_id, status, vendor, amount, currency, reference, "
-                "paid_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "paid_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(run_id) DO UPDATE SET status=excluded.status, "
+                "vendor=excluded.vendor, amount=excluded.amount, currency=excluded.currency, "
+                "reference=excluded.reference, paid_at=excluded.paid_at",
                 (
                     pk,
                     payment.status.value,
@@ -552,6 +605,44 @@ class RunStore:
                     payment.paid_at or _now(),
                 ),
             )
+
+    def review_queue(self) -> list[InvoiceRunResult]:
+        """Runs waiting on a human decision.
+
+        Membership comes from `v_review_queue` rather than being re-derived by
+        whatever renders it, so the dashboard and the analytics cannot disagree
+        about what "waiting on a human" means. Note what the view adds over a
+        plain status filter: `is_latest`, so a document that has been re-run
+        asks for one decision rather than one per attempt.
+        """
+        with self.connect() as conn:
+            run_ids = [row["run_id"] for row in conn.execute("SELECT run_id FROM v_review_queue")]
+        loaded = (self.load_result(run_id) for run_id in run_ids)
+        return [result for result in loaded if result is not None]
+
+    def rejected_runs(self) -> list[InvoiceRunResult]:
+        """Runs whose *effective* status is rejected.
+
+        Filtered here rather than by a view on purpose: the views read
+        `runs.final_status`, which is what the pipeline decided, and a
+        rejection a person has overturned is no longer a rejection.
+        `load_result` is what reconciles the two, so this has to go through it.
+        """
+        return [r for r in self.load_results() if r.final_status == FinalStatus.REJECTED]
+
+    def money_sent(self) -> dict[str, float]:
+        """What actually left the bank, by currency — successful payments only.
+
+        `payments.amount` on a declined row is the sum that was claimed and
+        refused, so summing the column blind reports money that never moved.
+        """
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT currency, SUM(amount) AS sent FROM payments "
+                "WHERE status = ? GROUP BY currency",
+                (PaymentStatus.SUCCESS.value,),
+            ).fetchall()
+        return {row["currency"]: row["sent"] for row in rows}
 
     # -- reads --------------------------------------------------------------
 

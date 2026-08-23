@@ -40,6 +40,11 @@ REVIEW_CODES: dict[IssueCode, str] = {
         "actually owed depends on an exchange rate that nothing in the document or our "
         "records establishes; a human must confirm the amount and the rate"
     ),
+    IssueCode.REVISION_OF_PAID_INVOICE: (
+        "the original invoice was already paid, so this revision cannot be settled by "
+        "paying it as well; a person must reconcile the difference — release the balance, "
+        "request a credit note, or reject the revision"
+    ),
     IssueCode.UNKNOWN_ITEM: (
         "the invoice bills for an item that is not in the inventory catalog, so nothing "
         "in our own records says we ordered or received it; a buyer must confirm the "

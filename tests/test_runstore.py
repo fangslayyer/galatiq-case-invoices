@@ -46,6 +46,83 @@ class TestSchema:
         }
         assert not drifted, f"schema.sql drifted from docs/schema.md: {sorted(drifted)}"
 
+    def test_a_new_issue_code_reaches_an_existing_database(self, store):
+        """Adding an IssueCode must not require a hand-written migration.
+        validation_issues.code has a live FK to issue_codes, so a database
+        created before the code existed would reject the first issue raising
+        it — on a real invoice, at run time."""
+        store.init()
+        with store.connect() as conn:
+            conn.execute("DELETE FROM issue_codes WHERE code = ?", (IssueCode.UNKNOWN_ITEM.value,))
+            assert not conn.execute(
+                "SELECT 1 FROM issue_codes WHERE code = ?", (IssueCode.UNKNOWN_ITEM.value,)
+            ).fetchone()
+        store.init()  # a plain re-init, exactly what `--init-db` does
+        with store.connect() as conn:
+            assert conn.execute(
+                "SELECT 1 FROM issue_codes WHERE code = ?", (IssueCode.UNKNOWN_ITEM.value,)
+            ).fetchone()
+
+    def test_registry_never_downgrades_a_paid_invoice(self, store):
+        """`outstanding_balance` reads the registry to decide what is still
+        owed, so letting a later non-paid run clear the paid flag is exactly
+        how an invoice becomes payable twice. A dashboard approval used to do
+        precisely that."""
+        store.init()
+        store.record_processed("INV-1004", "hash-v1", "Precision Parts", 1_890.0, "paid", None)
+
+        wrote = store.record_settlement(
+            "INV-1004", "hash-r1", "Precision Parts", 5_940.0, "duplicate", None
+        )
+        assert wrote is False
+        prior = store.get_processed("INV-1004")
+        assert prior.final_status == "paid" and prior.total == 1_890.0
+
+        # ...but a genuine settlement of the balance does update it.
+        wrote = store.record_settlement(
+            "INV-1004", "hash-r1", "Precision Parts", 5_940.0, "paid", None
+        )
+        assert wrote is True
+        prior = store.get_processed("INV-1004")
+        assert prior.final_status == "paid" and prior.total == 5_940.0
+
+    def test_review_queue_holds_exactly_what_awaits_a_decision(self, settings, db, fake_brain):
+        """Membership comes from `v_review_queue`, so the dashboard and the
+        analytics cannot disagree about what is waiting on a person."""
+        from invoiceflow.pipeline import Pipeline
+        from invoiceflow.review import apply_human_review
+
+        pipe = Pipeline(settings, llm=fake_brain)
+        escalated = pipe.run(INVOICES_DIR / "invoice_1008.txt")  # unknown items
+        pipe.run(INVOICES_DIR / "invoice_1001.txt")  # clean -> paid
+        pipe.run(INVOICES_DIR / "invoice_1003.txt")  # zero stock -> rejected
+        assert [r.run_id for r in pipe.store.review_queue()] == [escalated.run_id]
+
+        # Deciding it takes it out of the queue; the view's own
+        # `human_reviewed_at IS NULL` is what does that, not the status.
+        apply_human_review(pipe.store, escalated, approve=False, note="not ours")
+        assert pipe.store.review_queue() == []
+
+    def test_review_queue_and_rejected_track_the_effective_status(self, settings, db, fake_brain):
+        """A human's call moves a run between the two tabs; the stored status
+        the views read never changes."""
+        from invoiceflow.pipeline import Pipeline
+        from invoiceflow.review import apply_human_review
+
+        pipe = Pipeline(settings, llm=fake_brain)
+        rejected = pipe.run(INVOICES_DIR / "invoice_1003.txt")
+        assert [r.run_id for r in pipe.store.rejected_runs()] == [rejected.run_id]
+
+        apply_human_review(pipe.store, rejected, approve=True, note="overturned")
+        # Overturned, so it is no longer a rejection — even though runs.final_status
+        # still says 'rejected' and every view still reads it that way.
+        assert pipe.store.rejected_runs() == []
+        with pipe.store.connect() as conn:
+            stored = conn.execute(
+                "SELECT final_status FROM runs WHERE run_id = ?", (rejected.run_id,)
+            ).fetchone()["final_status"]
+        assert stored == "rejected"
+
     def test_every_issue_code_is_seeded(self, store):
         assert set(ISSUE_CATEGORIES) == set(IssueCode)
         with store.connect() as conn:

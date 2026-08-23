@@ -81,9 +81,38 @@ class TestRegistryOrdering:
         assert first.final_status == FinalStatus.PAID
         second = pipeline.run(INVOICES_DIR / "invoice_1004_revised.json")
         assert second.final_status == FinalStatus.NEEDS_REVIEW
-        assert IssueCode.REVISED_INVOICE in {i.code for i in second.validation.issues}
+        assert IssueCode.REVISION_OF_PAID_INVOICE in {i.code for i in second.validation.issues}
         # the paid record must survive the escalated revision
         assert pipeline.store.get_processed("INV-1004").final_status == "paid"
+
+    def test_revision_of_a_paid_invoice_survives_a_rogue_approver(self, settings, db, ground_truth):
+        """The money-moving version of the INV-1016 problem, held against the
+        agents that would wave it through. Before the rule existed this was
+        recorded `duplicate` — the payer refused correctly, but `duplicate` is
+        terminal and reaches no queue, so the outstanding balance was settled
+        by being forgotten."""
+        from invoiceflow.pipeline import Pipeline
+
+        pipe = Pipeline(settings, llm=RogueApprover(extractions=ground_truth))
+        first = pipe.run(INVOICES_DIR / "invoice_1004.json")
+        assert first.final_status == FinalStatus.PAID
+        assert first.payment.amount == 1890.0
+
+        second = pipe.run(INVOICES_DIR / "invoice_1004_revised.json")
+        assert second.final_status == FinalStatus.NEEDS_REVIEW
+        assert second.payment is None  # forced before the `pay` edge, not at the payer
+        assert IssueCode.REVISION_OF_PAID_INVOICE in {i.code for i in second.validation.issues}
+        # The reviewer is handed the balance, not just the fact of a revision.
+        detail = next(
+            i.detail
+            for i in second.validation.issues
+            if i.code == IssueCode.REVISION_OF_PAID_INVOICE
+        )
+        assert "$1,890.00" in detail and "$5,940.00" in detail
+        assert "$4,050.00 more is claimed than was paid" in detail
+        # ...and the original settlement is untouched.
+        prior = pipe.store.get_processed("INV-1004")
+        assert prior.final_status == "paid" and prior.total == 1890.0
 
     def test_exact_duplicate_never_paid_twice(self, pipeline):
         pipeline.run(INVOICES_DIR / "invoice_1001.txt")

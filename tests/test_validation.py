@@ -153,15 +153,44 @@ class TestDuplicates:
         assert ctx.issues[0].code == IssueCode.DUPLICATE_INVOICE
         assert ctx.issues[0].severity == Severity.CRITICAL
 
-    def test_same_number_different_content_is_revision(self, db, store):
+    def test_revision_of_an_unpaid_invoice_is_advisory(self, db, store):
+        # Nothing was paid, so a corrected invoice replacing a rejected one is
+        # the workflow working. It is re-validated on its own merits.
         inv = make_invoice()
         store.record_processed(
-            inv.invoice_number, "different-hash", inv.vendor, 100.0, "paid", None
+            inv.invoice_number, "different-hash", inv.vendor, 100.0, "rejected", None
         )
         ctx = ValidationContext(inv, db, store=store)
         check_duplicate(ctx)
         assert ctx.issues[0].code == IssueCode.REVISED_INVOICE
         assert ctx.issues[0].severity == Severity.WARNING
+
+    def test_revision_of_a_paid_invoice_states_the_balance(self, db, store):
+        # Paid 100, now claiming 500: the reviewer is told the 400, not merely
+        # that "the content differs" and left to go and look the old sum up.
+        inv = make_invoice(total=500.0)
+        store.record_processed(
+            inv.invoice_number, "different-hash", inv.vendor, 100.0, "paid", None
+        )
+        ctx = ValidationContext(inv, db, store=store)
+        check_duplicate(ctx)
+        assert ctx.issues[0].code == IssueCode.REVISION_OF_PAID_INVOICE
+        detail = ctx.issues[0].detail
+        assert "$100.00" in detail and "$500.00" in detail
+        assert "$400.00 more is claimed than was paid" in detail
+
+    def test_revision_below_what_was_paid_names_the_overpayment(self, db, store):
+        # The symmetric case, and the one that actually costs money: we have
+        # already sent more than the vendor now says they are owed.
+        inv = make_invoice(total=400.0)
+        store.record_processed(
+            inv.invoice_number, "different-hash", inv.vendor, 1_000.0, "paid", None
+        )
+        ctx = ValidationContext(inv, db, store=store)
+        check_duplicate(ctx)
+        assert ctx.issues[0].code == IssueCode.REVISION_OF_PAID_INVOICE
+        assert "$600.00 less is claimed than was paid" in ctx.issues[0].detail
+        assert "overpaid" in ctx.issues[0].detail
 
     def test_no_registry_attached_is_a_noop(self, db):
         # Unit-test convenience with a real behavior behind it: a context
