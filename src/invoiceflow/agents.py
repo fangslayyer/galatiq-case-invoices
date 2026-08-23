@@ -21,7 +21,16 @@ from .validation import ALL_CHECKS, ValidationContext, build_tools
 
 
 class ExtractionError(RuntimeError):
-    """Raised when the Extractor cannot produce a usable invoice after retries."""
+    """Raised when the Extractor cannot produce a usable invoice after retries.
+
+    `attempts` carries the feedback each failed attempt was given — the same
+    strings a successful run returns — so even a dead run keeps its
+    self-correction evidence (extraction_attempts in the run store).
+    """
+
+    def __init__(self, message: str, attempts: list[str] | None = None):
+        super().__init__(message)
+        self.attempts = attempts or []
 
 
 def _ask[SchemaT: BaseModel](
@@ -66,13 +75,18 @@ def run_extractor(
     raw_text: str,
     catalog: list[str],
     max_retries: int = 2,
-) -> tuple[Invoice, int]:
+) -> tuple[Invoice, list[str]]:
     """Extract with a self-correction loop: schema/sanity failures are fed
-    back to the agent verbatim. Returns (invoice, retries_used)."""
+    back to the agent verbatim.
+
+    Returns (invoice, attempts): one entry per *failed* attempt, holding the
+    feedback that went into the next prompt — the evidence the run store keeps
+    as extraction_attempts. An empty list is a clean first pass.
+    """
     system = SystemMessage(EXTRACTOR_SYSTEM.format(catalog=", ".join(catalog)))
+    attempts: list[str] = []
     feedback: list[str] = []
-    last_error = ""
-    for attempt in range(max_retries + 1):
+    for _ in range(max_retries + 1):
         human = Tag.DOC.wrap(raw_text)
         if feedback:
             human += "\n\nYour previous attempt failed. Fix these problems:\n" + Tag.ERRORS.wrap(
@@ -82,13 +96,14 @@ def run_extractor(
             invoice = _ask(llm, Invoice, [system, HumanMessage(human)])
             problems = _sanity_check(invoice)
             if not problems:
-                return invoice, attempt
+                return invoice, attempts
             feedback = problems
-            last_error = "; ".join(problems)
         except Exception as exc:  # schema validation / API shape errors
-            last_error = str(exc)
             feedback = [f"Structured output error: {exc}"]
-    raise ExtractionError(f"extraction failed after {max_retries + 1} attempts: {last_error}")
+        attempts.append("; ".join(feedback))
+    raise ExtractionError(
+        f"extraction failed after {max_retries + 1} attempts: {attempts[-1]}", attempts
+    )
 
 
 def _sanity_check(invoice: Invoice) -> list[str]:
@@ -135,10 +150,11 @@ def run_validator(llm: BaseChatModel, ctx: ValidationContext) -> ValidationRepor
             messages.append(ToolMessage(content=str(output), tool_call_id=call["id"]))
 
     # Safety net: business-critical checks always run, even if the agent
-    # chose not to call them.
-    for name, fn in ALL_CHECKS.items():
-        if name not in ctx.tools_used:
-            fn(ctx)
+    # chose not to call them. Which ones it skipped is recorded — that gap is
+    # the honest measure of the tool loop (validation_tool_runs.invoked_by).
+    safety_net = [name for name in ALL_CHECKS if name not in ctx.tools_used]
+    for name in safety_net:
+        ALL_CHECKS[name](ctx)
 
     issues_json = json.dumps([i.model_dump() for i in ctx.issues], indent=2)
     summary = _ask(
@@ -163,6 +179,7 @@ def run_validator(llm: BaseChatModel, ctx: ValidationContext) -> ValidationRepor
         issues=[*ctx.issues, *summary.extra_issues],
         summary=summary.summary,
         tools_used=ctx.tools_used,
+        safety_net_tools=safety_net,
     )
 
 

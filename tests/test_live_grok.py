@@ -25,19 +25,23 @@ pytestmark = [
 def grok_pipeline(tmp_path):
     from invoiceflow.pipeline import Pipeline
 
-    settings = Settings(db_path=tmp_path / "inventory.db", results_dir=tmp_path / "results")
+    settings = Settings(
+        db_path=tmp_path / "inventory.db",
+        runs_db_path=tmp_path / "invoiceflow.db",
+        results_dir=tmp_path / "results",
+    )
     Database(settings.db_path).init()
     return Pipeline(settings)
 
 
 def test_clean_invoice_is_paid(grok_pipeline):
-    result = grok_pipeline.run(INVOICES_DIR / "invoice_1001.txt", persist=False)
+    result = grok_pipeline.run(INVOICES_DIR / "invoice_1001.txt")
     assert result.final_status == FinalStatus.PAID
     assert result.invoice.invoice_number == "INV-1001"
 
 
 def test_messy_overstock_invoice_is_not_paid(grok_pipeline):
-    result = grok_pipeline.run(INVOICES_DIR / "invoice_1002.txt", persist=False)
+    result = grok_pipeline.run(INVOICES_DIR / "invoice_1002.txt")
     # Grok phrasing may vary; the outcome must not: never pay an over-stock order
     assert result.final_status in (FinalStatus.REJECTED, FinalStatus.NEEDS_REVIEW)
     assert result.payment is None
@@ -47,7 +51,7 @@ def test_messy_overstock_invoice_is_not_paid(grok_pipeline):
 def test_ocr_artifacts_are_understood(grok_pipeline):
     """invoice_1012 has 'INV 1012', '2O26', '$3,500.O0', 'Widget A' spacing —
     exactly the messiness the LLM must normalize into structured data."""
-    result = grok_pipeline.run(INVOICES_DIR / "invoice_1012.txt", persist=False)
+    result = grok_pipeline.run(INVOICES_DIR / "invoice_1012.txt")
     inv = result.invoice
     assert inv.invoice_number == "INV-1012"
     assert {li.item for li in inv.line_items} == {"WidgetA", "WidgetB", "GadgetX"}
@@ -56,7 +60,7 @@ def test_ocr_artifacts_are_understood(grok_pipeline):
 
 
 def test_corrupt_invoice_is_rejected(grok_pipeline):
-    result = grok_pipeline.run(INVOICES_DIR / "invoice_1009.json", persist=False)
+    result = grok_pipeline.run(INVOICES_DIR / "invoice_1009.json")
     assert result.final_status == FinalStatus.REJECTED
     assert result.payment is None
     # negative quantity must be preserved as evidence, not "fixed" by the LLM

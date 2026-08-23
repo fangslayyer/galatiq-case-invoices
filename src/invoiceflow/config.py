@@ -42,7 +42,11 @@ class Settings(BaseSettings):
     )
 
     db_path: Path = PROJECT_ROOT / "inventory.db"
-    results_dir: Path = PROJECT_ROOT / "results"
+    # The pipeline's own system of record (documents, runs, telemetry,
+    # registry). Separate from inventory.db on purpose: that one plays the
+    # legacy system we validate against (docs/schema.md D1).
+    runs_db_path: Path = PROJECT_ROOT / "invoiceflow.db"
+    results_dir: Path = PROJECT_ROOT / "results"  # --export-json output
 
     # Business rules
     scrutiny_threshold: float = 10_000.0  # invoices above this get extra scrutiny

@@ -65,7 +65,7 @@ ACCEPTANCE = [
 
 @pytest.mark.parametrize(("filename", "expected", "expected_codes"), ACCEPTANCE)
 def test_acceptance(pipeline, filename, expected, expected_codes):
-    result = pipeline.run(INVOICES_DIR / filename, persist=False)
+    result = pipeline.run(INVOICES_DIR / filename)
     assert result.final_status == expected, result.decision and result.decision.reasoning
     found = {i.code for i in result.validation.issues}
     assert expected_codes <= found
@@ -77,36 +77,44 @@ def test_acceptance(pipeline, filename, expected, expected_codes):
 
 class TestRegistryOrdering:
     def test_revised_invoice_flagged_after_original_paid(self, pipeline):
-        first = pipeline.run(INVOICES_DIR / "invoice_1004.json", persist=False)
+        first = pipeline.run(INVOICES_DIR / "invoice_1004.json")
         assert first.final_status == FinalStatus.PAID
-        second = pipeline.run(INVOICES_DIR / "invoice_1004_revised.json", persist=False)
+        second = pipeline.run(INVOICES_DIR / "invoice_1004_revised.json")
         assert second.final_status == FinalStatus.NEEDS_REVIEW
         assert IssueCode.REVISED_INVOICE in {i.code for i in second.validation.issues}
         # the paid record must survive the escalated revision
-        assert pipeline.db.get_processed("INV-1004").final_status == "paid"
+        assert pipeline.store.get_processed("INV-1004").final_status == "paid"
 
     def test_exact_duplicate_never_paid_twice(self, pipeline):
-        pipeline.run(INVOICES_DIR / "invoice_1001.txt", persist=False)
-        rerun = pipeline.run(INVOICES_DIR / "invoice_1001.txt", persist=False)
+        pipeline.run(INVOICES_DIR / "invoice_1001.txt")
+        rerun = pipeline.run(INVOICES_DIR / "invoice_1001.txt")
         assert rerun.final_status == FinalStatus.DUPLICATE
         assert rerun.payment is None
 
     def test_pdf_of_paid_invoice_is_cross_format_duplicate(self, pipeline):
-        pipeline.run(INVOICES_DIR / "invoice_1011.txt", persist=False)
-        pdf = pipeline.run(INVOICES_DIR / "invoice_1011.pdf", persist=False)
+        pipeline.run(INVOICES_DIR / "invoice_1011.txt")
+        pdf = pipeline.run(INVOICES_DIR / "invoice_1011.pdf")
         assert pdf.final_status == FinalStatus.DUPLICATE
 
 
 class TestResultPersistence:
-    def test_run_writes_result_json(self, pipeline, settings):
+    def test_run_is_recorded_and_exportable(self, pipeline, settings):
+        from invoiceflow.pipeline import export_result_json
+
         result = pipeline.run(INVOICES_DIR / "invoice_1001.txt")
-        files = list(settings.results_dir.glob("*.json"))
-        assert len(files) == 1
-        assert result.run_id in files[0].name
+        # The DB is the system of record ...
+        reloaded = pipeline.store.load_result(result.run_id)
+        assert reloaded is not None
+        assert reloaded.final_status == result.final_status
+        assert reloaded.invoice.invoice_number == result.invoice.invoice_number
+        # ... and the JSON file is derived from it on demand, not dual-written.
+        assert not list(settings.results_dir.glob("*.json"))
+        out = export_result_json(pipeline.store, result.run_id, settings.results_dir)
+        assert result.run_id in out.name and out.exists()
 
     def test_unreadable_file_fails_gracefully(self, pipeline, tmp_path):
         missing = tmp_path / "nope.txt"
-        result = pipeline.run(missing, persist=False)
+        result = pipeline.run(missing)
         assert result.final_status == FinalStatus.FAILED
         assert result.error
 
@@ -133,12 +141,12 @@ class RogueApprover(FakeBrain):
 
 
 @pytest.mark.parametrize("verdict", list(CritiqueVerdict))
-def test_hard_rules_outrank_a_rogue_approver(settings, db, ground_truth, verdict):
+def test_hard_rules_outrank_a_rogue_approver(settings, db, store, ground_truth, verdict):
     """No Critic verdict can keep a must_reject invoice approved or paid: the
     hard rule is applied before the verdict is consulted, and the edge into
     `pay` refuses a must_reject regardless of what either agent decided."""
     graph = build_graph(
-        settings, db, RogueApprover(extractions=ground_truth, critic_verdict=verdict)
+        settings, db, store, RogueApprover(extractions=ground_truth, critic_verdict=verdict)
     )
     state = graph.invoke(
         {
@@ -167,8 +175,8 @@ class TotallessRogue(RogueApprover):
         return inner
 
 
-def test_missing_total_goes_to_a_human_and_is_never_paid(settings, db, ground_truth):
-    graph = build_graph(settings, db, TotallessRogue(extractions=ground_truth))
+def test_missing_total_goes_to_a_human_and_is_never_paid(settings, db, store, ground_truth):
+    graph = build_graph(settings, db, store, TotallessRogue(extractions=ground_truth))
     state = graph.invoke(
         {
             "source_file_path": str(INVOICES_DIR / "invoice_1001.txt"),  # otherwise paid
@@ -184,10 +192,10 @@ def test_missing_total_goes_to_a_human_and_is_never_paid(settings, db, ground_tr
     assert any(e.event == "hard_rule_review" for e in state["trace"])
 
 
-def test_review_outranks_rejection_end_to_end(settings, db, ground_truth):
+def test_review_outranks_rejection_end_to_end(settings, db, store, ground_truth):
     """A fraud marking *and* an unestablished fact: the human confirms the fraud
     rather than the pipeline rejecting on evidence it could not fully check."""
-    graph = build_graph(settings, db, TotallessRogue(extractions=ground_truth))
+    graph = build_graph(settings, db, store, TotallessRogue(extractions=ground_truth))
     state = graph.invoke(
         {
             "source_file_path": str(INVOICES_DIR / "invoice_1003.txt"),  # fraud: zero-stock item
@@ -217,8 +225,8 @@ class EscalatingCritic(FakeBrain):
         return super().with_structured_output(schema, **kwargs)
 
 
-def test_escalation_cannot_soften_a_hard_rejection(settings, db, ground_truth):
-    graph = build_graph(settings, db, EscalatingCritic(extractions=ground_truth))
+def test_escalation_cannot_soften_a_hard_rejection(settings, db, store, ground_truth):
+    graph = build_graph(settings, db, store, EscalatingCritic(extractions=ground_truth))
     state = graph.invoke(
         {
             "source_file_path": str(INVOICES_DIR / "invoice_1003.txt"),  # fraud: zero-stock item
@@ -260,8 +268,8 @@ class AmnesiacExtractor(FakeBrain):
         return super().with_structured_output(schema, **kwargs)
 
 
-def test_extractor_self_correction_recovers(settings, db, ground_truth):
-    graph = build_graph(settings, db, AmnesiacExtractor(extractions=ground_truth))
+def test_extractor_self_correction_recovers(settings, db, store, ground_truth):
+    graph = build_graph(settings, db, store, AmnesiacExtractor(extractions=ground_truth))
     state = graph.invoke(
         {
             "source_file_path": str(INVOICES_DIR / "invoice_1001.txt"),
@@ -295,27 +303,29 @@ class TestPromptInjectionQuarantine:
         return path
 
     def test_quarantined_without_calling_the_llm(self, settings, db, tmp_path):
-        result = Pipeline(settings, llm=ExplodingBrain()).run(
-            self._poisoned(tmp_path), persist=False
-        )
+        result = Pipeline(settings, llm=ExplodingBrain()).run(self._poisoned(tmp_path))
         assert result.final_status == FinalStatus.NEEDS_REVIEW
         assert result.invoice is None
         assert result.decision is None
         assert result.payment is None
 
     def test_quarantine_reason_reaches_the_result(self, settings, db, tmp_path):
-        result = Pipeline(settings, llm=ExplodingBrain()).run(
-            self._poisoned(tmp_path), persist=False
-        )
+        result = Pipeline(settings, llm=ExplodingBrain()).run(self._poisoned(tmp_path))
         assert result.validation is not None
         assert {i.code for i in result.validation.issues} == {IssueCode.PROMPT_INJECTION_ATTEMPT}
         assert "<rule_constraints>" in result.validation.issues[0].detail
         assert any(e.event == "quarantined" for e in result.trace)
 
     def test_quarantined_invoice_is_not_recorded(self, settings, db, tmp_path):
-        Pipeline(settings, llm=ExplodingBrain()).run(self._poisoned(tmp_path), persist=False)
-        assert db.get_processed("INV-6660") is None
+        pipe = Pipeline(settings, llm=ExplodingBrain())
+        pipe.run(self._poisoned(tmp_path))
+        # Nothing lands in the payment registry — but the document itself IS
+        # kept, forged fences and all: the store is the quarantine evidence.
+        assert pipe.store.get_processed("INV-6660") is None
+        with pipe.store.connect() as conn:
+            row = conn.execute("SELECT raw_text FROM documents").fetchone()
+        assert row is not None and "rule_constraints" in row["raw_text"]
 
     def test_clean_document_is_unaffected(self, pipeline):
-        result = pipeline.run(INVOICES_DIR / "invoice_1001.txt", persist=False)
+        result = pipeline.run(INVOICES_DIR / "invoice_1001.txt")
         assert result.final_status == FinalStatus.PAID

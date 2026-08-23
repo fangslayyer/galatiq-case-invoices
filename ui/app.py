@@ -1,4 +1,4 @@
-"""InvoiceFlow review dashboard.
+"""InvoiceFlow review dashboard, reading straight from invoiceflow.db.
 
 Browse pipeline runs, inspect each agent's reasoning, and act on the ones a
 person should see. Two queues, kept apart on purpose:
@@ -6,13 +6,12 @@ person should see. Two queues, kept apart on purpose:
   Escalation queue — the agents could not decide; this needs a decision.
   Rejected         — the rules already decided; overturn it or confirm it.
 
-Either way the action updates the payment registry and the persisted run, and
-stamps `human_reviewed_at` so an unchecked auto-rejection is countable.
+A human action never edits what the agents wrote: it lands as a `human_reviews`
+row (plus a payment and a registry update where money moves), and the effective
+status is derived from it. "Unchecked" is simply the absence of any review.
 
 Run with:  uv run streamlit run ui/app.py
 """
-
-from datetime import UTC, datetime
 
 import streamlit as st
 
@@ -20,7 +19,7 @@ from invoiceflow.config import Settings
 from invoiceflow.db import Database
 from invoiceflow.models import FinalStatus, InvoiceRunResult, PaymentStatus, Severity
 from invoiceflow.payment import execute_payment
-from invoiceflow.pipeline import load_results
+from invoiceflow.runstore import RunStore
 
 st.set_page_config(page_title="InvoiceFlow", page_icon="🧾", layout="wide")
 
@@ -35,7 +34,8 @@ SEVERITY_ICON = {Severity.CRITICAL: "🔴", Severity.WARNING: "🟠", Severity.I
 
 settings = Settings()
 db = Database(settings.db_path)
-results = load_results(settings.results_dir)
+store = RunStore(settings.runs_db_path)
+results = store.load_results()
 
 st.title("🧾 InvoiceFlow")
 st.caption(
@@ -51,15 +51,12 @@ if not results:
     st.stop()
 
 
-def save(result: InvoiceRunResult) -> None:
-    (settings.results_dir / f"{result.run_id}.json").write_text(result.model_dump_json(indent=2))
-
-
 def resolve(result: InvoiceRunResult, approve: bool, reviewer_note: str) -> None:
     """Act on a run: pay it, reject it, or confirm the status it already has.
 
-    Confirming is not a no-op — it stamps `human_reviewed_at`, which is how an
-    auto-rejection stops counting as something nobody has checked.
+    Confirming is not a no-op — it lands a `human_reviews` row, which is how an
+    auto-rejection stops counting as something nobody has checked. The agents'
+    own reasoning is never edited; the review is its own record.
     """
     inv, decision = result.invoice, result.decision
     if inv is None or decision is None:
@@ -69,34 +66,38 @@ def resolve(result: InvoiceRunResult, approve: bool, reviewer_note: str) -> None
         st.error("This run has no extracted invoice or decision to act on.")
         return
 
-    stamp = datetime.now(UTC).isoformat(timespec="seconds")
     was = result.final_status
     if approve:
-        result.payment = execute_payment(db, inv, result.run_id)
-        result.final_status = (
-            FinalStatus.PAID
-            if result.payment.status == PaymentStatus.SUCCESS
-            else FinalStatus.DUPLICATE
+        payment = execute_payment(store, inv, result.run_id)
+        to_status = (
+            FinalStatus.PAID if payment.status == PaymentStatus.SUCCESS else FinalStatus.DUPLICATE
         )
+        if result.payment is None:
+            store.add_payment(result.run_id, payment, currency=inv.currency)
     else:
-        result.final_status = FinalStatus.REJECTED
-    verdict = "approved and paid" if approve else "rejected"
-    # "Confirmed" when the human agreed with what the pipeline already decided,
-    # "override" when they changed it — the trail should say which happened.
-    action = "override" if result.final_status != was else "confirmation"
-    decision.reasoning += f"\n\nHuman {action} at {stamp}: {verdict}." + (
-        f" Note: {reviewer_note}" if reviewer_note else ""
+        to_status = FinalStatus.REJECTED
+    # "confirm" when the human agreed with what the pipeline already decided,
+    # an override when they changed it — the trail says which happened.
+    # The three-way split reads better spelled out than as a nested ternary.
+    if to_status == was:  # noqa: SIM108
+        action = "confirm"
+    else:
+        action = "override_approve" if approve else "override_reject"
+    store.add_human_review(
+        result.run_id,
+        action=action,
+        from_status=was,
+        to_status=to_status,
+        note=reviewer_note,
     )
-    result.human_reviewed_at = stamp
-    db.record_processed(
+    store.record_processed(
         inv.invoice_number,
         inv.content_hash(),
         inv.vendor,
         inv.total,
-        result.final_status.value,
-        result.run_id,
+        to_status.value,
+        None,
     )
-    save(result)
 
 
 def render_run(result: InvoiceRunResult, *, actionable: bool = False) -> None:
@@ -143,6 +144,11 @@ def render_run(result: InvoiceRunResult, *, actionable: bool = False) -> None:
             st.success(
                 f"Payment: {result.payment.status} — "
                 f"${result.payment.amount:,.2f} to {result.payment.vendor}"
+            )
+        for hr in result.human_reviews:
+            st.info(
+                f"🧑 {hr.action.replace('_', ' ')} by {hr.reviewer} at {hr.reviewed_at}: "
+                f"{hr.from_status} → {hr.to_status}" + (f" — {hr.note}" if hr.note else "")
             )
 
     with st.expander("Full agent trace"):
@@ -234,6 +240,25 @@ with tab_db:
         hide_index=True,
     )
     st.markdown("**Processed-invoice registry**")
-    with db.connect() as conn:
-        rows = [dict(r) for r in conn.execute("SELECT * FROM processed_invoices").fetchall()]
+    with store.connect() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM invoice_registry").fetchall()]
     st.dataframe(rows, width="stretch", hide_index=True)
+
+    st.markdown("**Cost by agent** · from `v_cost_by_agent`")
+    with store.connect() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM v_cost_by_agent").fetchall()]
+    st.dataframe(rows, width="stretch", hide_index=True)
+
+    st.markdown("**Issue frequency** · from `v_issue_frequency`")
+    with store.connect() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM v_issue_frequency").fetchall()]
+    st.dataframe(rows, width="stretch", hide_index=True)
+
+    reprocessed = []
+    with store.connect() as conn:
+        reprocessed = [
+            dict(r) for r in conn.execute("SELECT * FROM v_reprocessed_documents").fetchall()
+        ]
+    if reprocessed:
+        st.markdown("**Reprocessed documents** · same content, multiple runs")
+        st.dataframe(reprocessed, width="stretch", hide_index=True)

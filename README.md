@@ -14,11 +14,12 @@ duplicate submissions, and data that simply doesn't add up.
 ```bash
 uv sync                                                    # install (Python 3.12)
 cp .env.example .env                                       # put your XAI_API_KEY in it
-uv run python main.py --init-db                            # create + seed inventory.db
+uv run python main.py --init-db                            # create both DBs (inventory + run store)
 uv run python main.py --invoice_path=data/invoices/invoice_1001.txt
 uv run python main.py --all                                # batch: all 20 sample files
 uv run streamlit run ui/app.py                             # review dashboard
 uv run python main.py --export-graph                       # re-render docs/graph.png
+uv run python main.py --export-json all                    # render runs from the DB to results/
 ```
 
 Grok is the pipeline's only brain — there is deliberately no rule-based
@@ -139,7 +140,7 @@ self-edge on `ingest`, and the `decide`/`critique` cycle is right there:
 ## Testing & quality
 
 ```bash
-uv run pytest                      # 110 offline tests, ~7s, no API key needed
+uv run pytest                      # 126 offline tests, ~10s, no API key needed
 uv run pytest --cov=invoiceflow    # with coverage
 uv run pytest -m live              # against real Grok (needs XAI_API_KEY)
 uv run ruff check && uv run ruff format --check
@@ -186,7 +187,7 @@ LANGSMITH_PROJECT=invoiceflow
 
 Runs are named per invoice and tagged with the model, the CLI prints a banner
 whenever tracing is live, and the test suite forces it off
-(`tests/__init__.py`) so 110 fake-brain runs never land in a real project. The
+(`tests/__init__.py`) so 126 fake-brain runs never land in a real project. The
 banner reads the same four environment variables the tracer itself does
 (`config.TRACING_ENV_VARS`), so a traced run can never look untraced.
 
@@ -200,24 +201,37 @@ src/invoiceflow/
   validation.py          deterministic validation tools (the Validator's toolbox)
   rules.py               hard business rules constraining the Approver
   models.py              Pydantic schemas for every agent's structured output
-  db.py                  SQLite inventory + processed-invoice registry
-  pipeline.py            run wrapper: Grok factory, run IDs, timing, JSON results
-  cli.py                 rich terminal UI: per-stage trace, batch summary
+  db.py                  SQLite inventory (the mock legacy system)
+  schema.sql             invoiceflow.db DDL — 21 tables + 8 views (docs/schema.md)
+  runstore.py            the system of record: documents, runs, telemetry, registry
+  recording.py           per-run turn/LLM-call recorder (tokens, latency, cost)
+  pipeline.py            run wrapper: Grok factory, run IDs, one-transaction persist
+  cli.py                 rich terminal UI: per-stage trace, usage lines, batch summary
 ui/app.py                Streamlit dashboard: runs browser + escalation queue
-tests/                   114 tests (110 offline + 4 live-marked)
+tests/                   130 tests (126 offline + 4 live-marked)
 data/invoices/           provided sample invoices (the acceptance dataset)
 docs/graph.png|.mmd      compiled LangGraph topology (`--export-graph` re-renders)
+docs/beyond-the-brief.md additions beyond CASE.md, and why each one earns its place
+docs/schema.md           the relational data model, with design rationale
 ```
 
 ## Business impact
 
 Every invoice is processed in seconds instead of days, with a full audit
-trail (per-run JSON: every agent's reasoning, every check, every critique
-round). The error modes behind the old 30% rate — mis-keyed data, overlooked
+trail in a relational store (`invoiceflow.db`: every agent turn, every LLM
+call with tokens and latency, every check, every critique round, every human
+override — ready for SQL like "top rejection reasons" or "cost per agent";
+`--export-json` renders any run back to a single file). The error modes
+behind the old 30% rate — mis-keyed data, overlooked
 stock mismatches, duplicate payments, fraud pressure tactics — each have a
 dedicated, tested defense. Humans stop transcribing and only touch the cases
 that genuinely need judgment, delivered to them in a queue with the evidence
 already assembled.
+
+Several of the defences above were never asked for by the brief — duplicate
+detection, the prompt-injection quarantine, payment idempotency. What each one is
+and why it earns its place is written up in
+[docs/beyond-the-brief.md](docs/beyond-the-brief.md).
 
 ### Scope cuts (deliberate)
 

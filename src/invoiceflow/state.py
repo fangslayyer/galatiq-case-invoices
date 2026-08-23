@@ -10,10 +10,12 @@ from .models import (
     CritiqueRound,
     FinalStatus,
     Invoice,
+    OverrideRecord,
     PaymentResult,
     TraceEvent,
     ValidationReport,
 )
+from .recording import RunRecorder
 from .rules import RuleConstraints
 
 
@@ -32,6 +34,12 @@ class PipelineState(TypedDict, total=False):
     trace: Required[Annotated[list[TraceEvent], operator.add]]
     critique_rounds: Required[Annotated[list[CritiqueRound], operator.add]]
 
+    # Observability plumbing, also supplied by the runner. Optional so the
+    # graph can still be driven bare in tests: nodes fall back to a throwaway
+    # recorder and a registry entry with no run reference.
+    recorder: RunRecorder
+    run_pk: int  # runs.id — exists from begin_run, so the registry can FK it
+
     # Produced as the pipeline runs.
     raw_text: str
     # Set only by the ingest gate: the document forged prompt structure, so it
@@ -39,9 +47,19 @@ class PipelineState(TypedDict, total=False):
     quarantine_reason: str
     invoice: Invoice
     extraction_retries: int
+    # One entry per failed extraction attempt: the feedback fed back into the
+    # retry prompt (extraction_attempts in the run store).
+    extraction_attempts: list[str]
+    # Which document (by content) this run processed, and how many runs have
+    # now touched it — 2+ means a reprocess, surfaced as a CLI notice.
+    document_id: int
+    document_run_no: int
     report: ValidationReport
     constraints: RuleConstraints
     decision: ApprovalDecision
+    # System overrides of agent decisions (hard rules, critic escalation) —
+    # appended by the critique node, persisted as decision_overrides.
+    overrides: Annotated[list[OverrideRecord], operator.add]
     payment: PaymentResult
     final_status: FinalStatus
     error: str

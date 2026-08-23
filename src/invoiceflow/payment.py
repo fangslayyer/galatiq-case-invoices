@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
-from .db import Database
 from .models import FinalStatus, Invoice, PaymentResult, PaymentStatus
+
+if TYPE_CHECKING:
+    from .runstore import RunStore
 
 log = logging.getLogger(__name__)
 
@@ -20,7 +24,7 @@ class UnpayableInvoiceError(ValueError):
     """Raised when an invoice reaches payment without an amount to pay."""
 
 
-def execute_payment(db: Database, invoice: Invoice, run_id: str) -> PaymentResult:
+def execute_payment(store: RunStore, invoice: Invoice, run_id: str) -> PaymentResult:
     """Pay an approved invoice — unless the registry says it was already paid."""
     if invoice.total is None:
         # Unreachable: a missing total sets must_review, and the edge into `pay`
@@ -29,7 +33,7 @@ def execute_payment(db: Database, invoice: Invoice, run_id: str) -> PaymentResul
         raise UnpayableInvoiceError(
             f"{invoice.invoice_number} has no total amount; it must never reach payment"
         )
-    prior = db.get_processed(invoice.invoice_number)
+    prior = store.get_processed(invoice.invoice_number)
     if prior is not None and prior.final_status == FinalStatus.PAID:
         log.warning("Refusing to double-pay %s (already paid)", invoice.invoice_number)
         return PaymentResult(
@@ -37,6 +41,7 @@ def execute_payment(db: Database, invoice: Invoice, run_id: str) -> PaymentResul
             vendor=invoice.vendor,
             amount=invoice.total,
             reference=run_id,
+            paid_at=datetime.now(UTC).isoformat(timespec="seconds"),
         )
     result = mock_payment(invoice.vendor, invoice.total)
     return PaymentResult(
@@ -46,4 +51,5 @@ def execute_payment(db: Database, invoice: Invoice, run_id: str) -> PaymentResul
         vendor=invoice.vendor,
         amount=invoice.total,
         reference=run_id,
+        paid_at=datetime.now(UTC).isoformat(timespec="seconds"),
     )

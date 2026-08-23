@@ -138,28 +138,38 @@ class TestIntegrity:
 
 
 class TestDuplicates:
-    def test_first_sighting_is_clean(self, db):
-        ctx = ValidationContext(make_invoice(), db)
+    def test_first_sighting_is_clean(self, db, store):
+        ctx = ValidationContext(make_invoice(), db, store=store)
         check_duplicate(ctx)
         assert ctx.issues == []
 
-    def test_exact_duplicate_is_critical(self, db):
+    def test_exact_duplicate_is_critical(self, db, store):
         inv = make_invoice()
-        db.record_processed(
-            inv.invoice_number, inv.content_hash(), inv.vendor, inv.total, "paid", "r1"
+        store.record_processed(
+            inv.invoice_number, inv.content_hash(), inv.vendor, inv.total, "paid", None
         )
-        ctx = ValidationContext(inv, db)
+        ctx = ValidationContext(inv, db, store=store)
         check_duplicate(ctx)
         assert ctx.issues[0].code == IssueCode.DUPLICATE_INVOICE
         assert ctx.issues[0].severity == Severity.CRITICAL
 
-    def test_same_number_different_content_is_revision(self, db):
+    def test_same_number_different_content_is_revision(self, db, store):
         inv = make_invoice()
-        db.record_processed(inv.invoice_number, "different-hash", inv.vendor, 100.0, "paid", "r1")
-        ctx = ValidationContext(inv, db)
+        store.record_processed(
+            inv.invoice_number, "different-hash", inv.vendor, 100.0, "paid", None
+        )
+        ctx = ValidationContext(inv, db, store=store)
         check_duplicate(ctx)
         assert ctx.issues[0].code == IssueCode.REVISED_INVOICE
         assert ctx.issues[0].severity == Severity.WARNING
+
+    def test_no_registry_attached_is_a_noop(self, db):
+        # Unit-test convenience with a real behavior behind it: a context
+        # without a registry has nothing to compare against, so the check
+        # reports nothing rather than guessing.
+        ctx = ValidationContext(make_invoice(), db)
+        check_duplicate(ctx)
+        assert ctx.issues == []
 
 
 class TestPromptSafety:

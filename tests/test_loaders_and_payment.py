@@ -25,23 +25,24 @@ class TestLoaders:
 
 
 class TestPaymentIdempotency:
-    def test_pays_unseen_invoice(self, db, capsys):
-        result = execute_payment(db, make_invoice(), "run-1")
+    def test_pays_unseen_invoice(self, store, capsys):
+        result = execute_payment(store, make_invoice(), "run-1")
         assert result.status == PaymentStatus.SUCCESS
+        assert result.paid_at
         assert "Paid 500.0 to Test Vendor" in capsys.readouterr().out
 
-    def test_refuses_an_invoice_with_no_total(self, db, capsys):
+    def test_refuses_an_invoice_with_no_total(self, store, capsys):
         # Unreachable through the graph, but it must fail loudly rather than
         # pay $0.00 and record the invoice as settled.
         with pytest.raises(UnpayableInvoiceError):
-            execute_payment(db, make_invoice(total=None), "run-x")
+            execute_payment(store, make_invoice(total=None), "run-x")
         assert "Paid" not in capsys.readouterr().out
 
-    def test_refuses_double_payment(self, db, capsys):
+    def test_refuses_double_payment(self, store, capsys):
         inv = make_invoice()
-        db.record_processed(
-            inv.invoice_number, inv.content_hash(), inv.vendor, inv.total, "paid", "r1"
+        store.record_processed(
+            inv.invoice_number, inv.content_hash(), inv.vendor, inv.total, "paid", None
         )
-        result = execute_payment(db, inv, "run-2")
+        result = execute_payment(store, inv, "run-2")
         assert result.status == PaymentStatus.SKIPPED_ALREADY_PAID
         assert "Paid" not in capsys.readouterr().out

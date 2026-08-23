@@ -1,4 +1,4 @@
-"""Command-line interface: single-invoice runs, batch mode, and DB setup."""
+"""Command-line interface: single-invoice runs, batch mode, DB setup, exports."""
 
 from __future__ import annotations
 
@@ -43,9 +43,16 @@ def main(
     process_all: bool = typer.Option(
         False, "--all", help="Process every invoice in data/invoices/"
     ),
-    init_db: bool = typer.Option(False, "--init-db", help="Create and seed the inventory DB"),
+    init_db: bool = typer.Option(
+        False, "--init-db", help="Create and seed the inventory DB + the run store"
+    ),
     reset_db: bool = typer.Option(
-        False, "--reset-db", help="Drop and recreate the inventory DB and processed registry"
+        False, "--reset-db", help="Drop and recreate both databases (inventory + run store)"
+    ),
+    export_json: str | None = typer.Option(
+        None,
+        "--export-json",
+        help="Render a recorded run from the DB to results/<run_id>.json ('all' for every run)",
     ),
     export_graph: bool = typer.Option(
         False,
@@ -69,12 +76,21 @@ def main(
             return
 
     if init_db or reset_db:
+        from .runstore import RunStore
+
         db.init(reset=reset_db)
+        RunStore(settings.runs_db_path).init(reset=reset_db)
         console.print(
             f"[green]✓[/green] Inventory database ready at [bold]{settings.db_path}[/bold]"
         )
         for rec in db.all_items():
             console.print(f"   {rec.item}: {rec.stock} in stock @ ${rec.unit_price:,.2f}")
+        console.print(f"[green]✓[/green] Run store ready at [bold]{settings.runs_db_path}[/bold]")
+        if not (invoice_path or process_all):
+            return
+
+    if export_json is not None:
+        _export_json(settings, export_json)
         if not (invoice_path or process_all):
             return
 
@@ -116,10 +132,63 @@ def main(
         console.rule(f"[bold]{Path(path).name}[/bold]")
         result = pipeline.run(path)
         _render_run(result)
+        _render_usage(pipeline, result)
         results.append(result)
 
     if len(results) > 1:
         _render_summary(results)
+        calls, tokens, cost = _batch_usage(pipeline, results)
+        console.print(
+            f"[dim]Batch usage: {calls} LLM call(s) · {tokens:,} tokens"
+            + (f" · ${cost:.4f}[/dim]" if cost is not None else "[/dim]")
+        )
+
+
+def _render_usage(pipeline, result: InvoiceRunResult) -> None:
+    """One dim line of telemetry per run — the observability the DB now keeps.
+
+    Cost appears only when model_pricing has a row for the backend; a missing
+    price renders as nothing rather than as a made-up $0.
+    """
+    calls, tokens, cost = pipeline.store.run_usage(result.run_id)
+    if not calls:
+        return
+    line = f"  [dim]{calls} LLM call(s) · {tokens:,} tokens"
+    if cost is not None:
+        line += f" · ${cost:.4f}"
+    console.print(line + "[/dim]")
+
+
+def _batch_usage(pipeline, results: list[InvoiceRunResult]) -> tuple[int, int, float | None]:
+    calls = tokens = 0
+    cost: float | None = None
+    for r in results:
+        c, t, usd = pipeline.store.run_usage(r.run_id)
+        calls += c
+        tokens += t
+        if usd is not None:
+            cost = (cost or 0.0) + usd
+    return calls, tokens, cost
+
+
+def _export_json(settings: Settings, which: str) -> None:
+    """Render recorded runs from the DB to results/*.json — derived artifacts,
+    never a second writer (docs/schema.md, phase 6)."""
+    from .pipeline import export_result_json
+    from .runstore import RunStore
+
+    store = RunStore(settings.runs_db_path)
+    run_ids = [r.run_id for r in store.load_results()] if which == "all" else [which]
+    if not run_ids:
+        console.print("[yellow]No recorded runs to export.[/yellow]")
+        return
+    for run_id in run_ids:
+        try:
+            out = export_result_json(store, run_id, settings.results_dir)
+        except KeyError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1) from None
+        console.print(f"[green]✓[/green] {out}")
 
 
 def _render_run(result: InvoiceRunResult) -> None:
@@ -129,6 +198,13 @@ def _render_run(result: InvoiceRunResult) -> None:
             f"  [bold]{inv.invoice_number}[/bold] · {inv.vendor or '[dim]<no vendor>[/dim]'} · "
             f"total: {_money(inv.total, inv.currency)} · "
             f"due: {inv.due_date or inv.due_date_raw or '—'}"
+        )
+    if result.document_run_no > 1:
+        # Non-blocking by design: a prompt would break --all and scripting, and
+        # double payment is already prevented downstream (check_duplicate).
+        console.print(
+            f"  [yellow]⟳ reprocessing:[/yellow] run #{result.document_run_no} "
+            "for this exact document content"
         )
     for ev in result.trace:
         style = "dim"
@@ -198,9 +274,13 @@ def _export_graph(settings: Settings, db: Database) -> None:
     from langchain_core.language_models import FakeListChatModel
 
     from .graph import build_graph, export_graph_image
+    from .runstore import RunStore
 
     try:
-        written = export_graph_image(build_graph(settings, db, FakeListChatModel(responses=[])))
+        graph = build_graph(
+            settings, db, RunStore(settings.runs_db_path), FakeListChatModel(responses=[])
+        )
+        written = export_graph_image(graph)
     except Exception as exc:  # mermaid.ink unreachable, render error, unwritable docs/
         console.print(f"[red]Graph export failed:[/red] {exc}")
         raise typer.Exit(1) from None

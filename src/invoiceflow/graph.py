@@ -11,6 +11,7 @@ agent's structured output, which keeps the flow inspectable and testable.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 from langchain_core.language_models import BaseChatModel
@@ -25,12 +26,15 @@ from .models import (
     CritiqueRound,
     CritiqueVerdict,
     FinalStatus,
+    OverrideRecord,
     PaymentStatus,
     TraceEvent,
     ValidationReport,
 )
 from .payment import execute_payment
+from .recording import RunRecorder
 from .rules import evaluate_rules
+from .runstore import RunStore
 from .state import PipelineState
 from .validation import ValidationContext, forged_fence_issue
 
@@ -41,7 +45,18 @@ DOCS_DIR = PROJECT_ROOT / "docs"
 
 def _ev(stage: str, event: str, detail: str = "") -> TraceEvent:
     log.info("[%s] %s%s", stage, event, f" — {detail}" if detail else "")
-    return TraceEvent(stage=stage, event=event, detail=detail)
+    return TraceEvent(
+        stage=stage,
+        event=event,
+        detail=detail,
+        at=datetime.now(UTC).isoformat(timespec="seconds"),
+    )
+
+
+def _recorder(state: PipelineState) -> RunRecorder:
+    """The run's recorder, or a throwaway one when the graph is driven bare
+    (direct `graph.invoke` in tests): the nodes never need to care."""
+    return state.get("recorder") or RunRecorder()
 
 
 def _prompt_safety_gate(raw_text: str) -> ValidationReport | None:
@@ -63,7 +78,7 @@ def _prompt_safety_gate(raw_text: str) -> ValidationReport | None:
     )
 
 
-def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
+def build_graph(settings: Settings, db: Database, store: RunStore, llm: BaseChatModel):
     def ingest(state: PipelineState) -> dict:
         trace = [_ev("ingestion", "loading", state["source_file_path"])]
         try:
@@ -71,6 +86,20 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
         except (OSError, ValueError) as exc:
             trace.append(_ev("ingestion", "load_failed", str(exc)))
             return {"error": str(exc), "final_status": FinalStatus.FAILED, "trace": trace}
+        # Register the document before anything else touches it: identity is
+        # the content hash, so a re-run (from any path) is visible immediately,
+        # and a quarantined document keeps its evidence in the store.
+        document_id, prior_runs = store.register_document(raw_text, state["source_file_path"])
+        doc_updates = {"document_id": document_id, "document_run_no": prior_runs + 1}
+        if prior_runs:
+            trace.append(
+                _ev(
+                    "ingestion",
+                    "reprocessed_document",
+                    f"this document has been processed {prior_runs} time(s) before "
+                    f"(run #{prior_runs + 1} for identical content)",
+                )
+            )
         quarantine = _prompt_safety_gate(raw_text)
         if quarantine is not None:
             reason = quarantine.issues[0].detail
@@ -80,20 +109,28 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
                 "quarantine_reason": reason,
                 "report": quarantine,
                 "trace": trace,
+                **doc_updates,
             }
         catalog = [rec.item for rec in db.all_items()]
+        rec = _recorder(state)
         try:
-            invoice, retries = run_extractor(
-                llm, raw_text, catalog, max_retries=settings.max_extraction_retries
-            )
+            with rec.turn("ingest", "extractor") as turn:
+                invoice, attempts = run_extractor(
+                    llm, raw_text, catalog, max_retries=settings.max_extraction_retries
+                )
+                if attempts:
+                    turn.outcome = "retried"
         except ExtractionError as exc:
             trace.append(_ev("ingestion", "extraction_failed", str(exc)))
             return {
                 "raw_text": raw_text,
+                "extraction_attempts": exc.attempts,
                 "error": str(exc),
                 "final_status": FinalStatus.FAILED,
                 "trace": trace,
+                **doc_updates,
             }
+        retries = len(attempts)
         trace.append(
             _ev(
                 "ingestion",
@@ -111,17 +148,21 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
             "raw_text": raw_text,
             "invoice": invoice,
             "extraction_retries": retries,
+            "extraction_attempts": attempts,
             "trace": trace,
+            **doc_updates,
         }
 
     def validate(state: PipelineState) -> dict:
         ctx = ValidationContext(
             invoice=state["invoice"],
             db=db,
+            store=store,
             expected_currency=settings.expected_currency,
             raw_text=state.get("raw_text", ""),
         )
-        report = run_validator(llm, ctx)
+        with _recorder(state).turn("validate", "validator"):
+            report = run_validator(llm, ctx)
         trace = [
             _ev(
                 "validation",
@@ -141,7 +182,16 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
         )
         rounds = state.get("critique_rounds") or []
         feedback = rounds[-1].critique.feedback if rounds else None
-        decision = run_approver(llm, state["invoice"], state["report"], constraints, feedback)
+        rec = _recorder(state)
+        with rec.turn(
+            "decide",
+            "approver",
+            round_no=len(rounds) + 1,
+            # A redraft is literally caused by the Critic's revise verdict —
+            # recorded as a self-FK on the spine, not inferred from round_no.
+            triggered_by=rec.last_seq("critic") if feedback else None,
+        ):
+            decision = run_approver(llm, state["invoice"], state["report"], constraints, feedback)
         trace = [
             _ev(
                 "approval",
@@ -154,29 +204,53 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
     def critique(state: PipelineState) -> dict:
         decision = state["decision"]
         constraints = state["constraints"]
-        crit = run_critic(llm, state["invoice"], state["report"], constraints, decision)
-        trace = [_ev("approval", f"critique:{crit.verdict}", crit.feedback)]
+        rec = _recorder(state)
         rounds_so_far = len(state.get("critique_rounds") or [])
+        with rec.turn(
+            "critique",
+            "critic",
+            round_no=rounds_so_far + 1,
+            triggered_by=rec.last_seq("approver"),
+        ):
+            crit = run_critic(llm, state["invoice"], state["report"], constraints, decision)
+        trace = [_ev("approval", f"critique:{crit.verdict}", crit.feedback)]
         exhausted = (
             crit.verdict == CritiqueVerdict.REVISE
             and rounds_so_far + 1 > settings.max_critique_rounds
         )
 
         updates: dict = {"critique_rounds": [CritiqueRound(decision=decision, critique=crit)]}
+
         # Precedence, top to bottom: hard rules outrank the Critic, which
         # outranks the Approver. The first match terminates the chain — no
         # verdict below can soften it, not even an escalation to a human.
+        def override(kind: str, to_status: ApprovalStatus, reasoning: str) -> None:
+            """Replace the decision for routing, and record the replacement as
+            its own fact: the Approver's words stay verbatim in the round."""
+            updates["decision"] = decision.model_copy(
+                update={"status": to_status, "reasoning": reasoning}
+            )
+            updates["overrides"] = [
+                OverrideRecord(
+                    round_no=rounds_so_far + 1,
+                    kind=kind,
+                    from_status=decision.status,
+                    to_status=to_status,
+                    reasoning=reasoning,
+                    created_at=datetime.now(UTC).isoformat(timespec="seconds"),
+                )
+            ]
+
         if constraints.must_review:
             # Outranks must_reject on purpose. A rejection is an accusation, and
             # where the rules also say a fact could not be established, the
             # accusation is exactly what a person should confirm before it stands.
             if decision.status != ApprovalStatus.NEEDS_REVIEW:
-                updates["decision"] = decision.model_copy(
-                    update={
-                        "status": ApprovalStatus.NEEDS_REVIEW,
-                        "reasoning": "Hard business rule override: this invoice cannot be "
-                        "decided automatically. " + "; ".join(constraints.review_reasons),
-                    }
+                override(
+                    "hard_rule_review",
+                    ApprovalStatus.NEEDS_REVIEW,
+                    "Hard business rule override: this invoice cannot be "
+                    "decided automatically. " + "; ".join(constraints.review_reasons),
                 )
                 trace.append(
                     _ev("approval", "hard_rule_review", f"{decision.status} -> needs_review")
@@ -186,12 +260,11 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
             # in place, and keep `hard_rule_override` meaning what it says —
             # an agent tried to talk its way past a hard rule.
             if decision.status != ApprovalStatus.REJECTED:
-                updates["decision"] = decision.model_copy(
-                    update={
-                        "status": ApprovalStatus.REJECTED,
-                        "reasoning": "Hard business rule override: critical validation failures "
-                        "forbid approval. " + "; ".join(constraints.reject_reasons),
-                    }
+                override(
+                    "hard_rule_reject",
+                    ApprovalStatus.REJECTED,
+                    "Hard business rule override: critical validation failures "
+                    "forbid approval. " + "; ".join(constraints.reject_reasons),
                 )
                 trace.append(
                     _ev("approval", "hard_rule_override", f"{decision.status} -> rejected")
@@ -202,18 +275,17 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
                 if exhausted
                 else crit.feedback
             )
-            updates["decision"] = decision.model_copy(
-                update={
-                    "status": ApprovalStatus.NEEDS_REVIEW,
-                    "reasoning": f"{decision.reasoning}\n\nEscalated by Critic: {reason}",
-                }
+            override(
+                "critic_exhausted" if exhausted else "critic_escalation",
+                ApprovalStatus.NEEDS_REVIEW,
+                f"{decision.reasoning}\n\nEscalated by Critic: {reason}",
             )
             trace.append(_ev("approval", "escalated", reason))
         updates["trace"] = trace
         return updates
 
     def pay(state: PipelineState) -> dict:
-        result = execute_payment(db, state["invoice"], state["run_id"])
+        result = execute_payment(store, state["invoice"], state["run_id"])
         return {
             "payment": result,
             "trace": [
@@ -230,7 +302,7 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
         trace = [_ev("record", f"final:{final_status}")]
         invoice = state.get("invoice")
         if invoice is not None and final_status not in (FinalStatus.FAILED, FinalStatus.DUPLICATE):
-            prior = db.get_processed(invoice.invoice_number)
+            prior = store.get_processed(invoice.invoice_number)
             keeps_paid = (
                 prior is not None
                 and prior.final_status == FinalStatus.PAID
@@ -241,13 +313,16 @@ def build_graph(settings: Settings, db: Database, llm: BaseChatModel):
                     _ev("record", "registry_kept", f"{invoice.invoice_number} stays 'paid'")
                 )
             else:
-                db.record_processed(
+                # Written mid-run on purpose — the one mutable table: payment
+                # idempotency must be visible to the very next run, not after
+                # some later persistence step.
+                store.record_processed(
                     invoice.invoice_number,
                     invoice.content_hash(),
                     invoice.vendor,
                     invoice.total,
                     final_status.value,
-                    state["run_id"],
+                    state.get("run_pk"),
                 )
                 trace.append(
                     _ev("record", "registry_updated", f"{invoice.invoice_number} -> {final_status}")

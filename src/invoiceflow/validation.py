@@ -13,12 +13,16 @@ import functools
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from langchain_core.tools import BaseTool, tool
 
 from .db import Database
 from .models import Invoice, IssueCode, Severity, ValidationIssue
 from .prompts import Tag
+
+if TYPE_CHECKING:
+    from .runstore import RunStore
 
 MONEY_TOLERANCE = 0.01
 
@@ -29,6 +33,10 @@ class ValidationContext:
 
     invoice: Invoice
     db: Database
+    # The processed-invoice registry (invoiceflow.db). None in unit tests that
+    # exercise other checks; check_duplicate is then a no-op with no registry
+    # to compare against.
+    store: RunStore | None = None
     expected_currency: str = "USD"
     # The document as loaded, before any agent saw it — the only text that can
     # carry an injection attempt. Empty when a caller checks an invoice alone.
@@ -217,7 +225,9 @@ def check_duplicate(ctx: ValidationContext) -> None:
     """Compare against the processed-invoice registry: exact duplicates must
     never be paid twice; same-number-different-content means a revision."""
     inv = ctx.invoice
-    prior = ctx.db.get_processed(inv.invoice_number)
+    if ctx.store is None:
+        return  # no registry attached — nothing to compare against
+    prior = ctx.store.get_processed(inv.invoice_number)
     if prior is not None:
         if prior.content_hash == inv.content_hash():
             ctx.add_issue(

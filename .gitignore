@@ -10,6 +10,7 @@ htmlcov/
 
 # Project runtime artifacts
 inventory.db
+invoiceflow.db*
 results/
 
 # Secrets

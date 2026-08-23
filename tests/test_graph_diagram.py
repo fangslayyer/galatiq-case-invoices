@@ -14,8 +14,8 @@ from invoiceflow.graph import build_graph
 GRAPH_MMD = PROJECT_ROOT / "docs" / "graph.mmd"
 
 
-def test_committed_diagram_matches_compiled_topology(settings, db, fake_brain) -> None:
-    compiled = build_graph(settings, db, fake_brain)
+def test_committed_diagram_matches_compiled_topology(settings, db, store, fake_brain) -> None:
+    compiled = build_graph(settings, db, store, fake_brain)
     assert GRAPH_MMD.read_text() == compiled.get_graph().draw_mermaid(), (
         "docs/graph.mmd no longer matches the compiled graph — "
         "re-export it with: uv run python main.py --export-graph"

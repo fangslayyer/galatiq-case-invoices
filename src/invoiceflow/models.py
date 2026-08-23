@@ -46,6 +46,15 @@ class IssueCode(StrEnum):
     AGENT_OBSERVATION = "agent_observation"
 
 
+class RuleReasonKind(StrEnum):
+    """Which constraint bucket a rule reason belongs to (rule_reasons.kind)."""
+
+    REJECT = "reject"
+    REVIEW = "review"
+    SCRUTINY = "scrutiny"
+    ADVISORY = "advisory"
+
+
 class FinalStatus(StrEnum):
     PAID = "paid"
     REJECTED = "rejected"
@@ -165,6 +174,10 @@ class ValidationReport(BaseModel):
     issues: list[ValidationIssue] = Field(default_factory=list)
     summary: str = ""
     tools_used: list[str] = Field(default_factory=list)
+    # The subset of tools_used the pipeline ran because the agent skipped them.
+    # Persisted as validation_tool_runs.invoked_by: it is the honest measure of
+    # how much of the tool loop's coverage the agent actually chose.
+    safety_net_tools: list[str] = Field(default_factory=list)
 
     @property
     def has_critical(self) -> bool:
@@ -239,12 +252,38 @@ class PaymentResult(BaseModel):
     vendor: str
     amount: float
     reference: str = ""
+    paid_at: str = ""
 
 
 class TraceEvent(BaseModel):
     stage: str
     event: str
     detail: str = ""
+    at: str = ""  # ISO timestamp; gives the trace per-stage timings
+
+
+class OverrideRecord(BaseModel):
+    """What the *system* did about an agent decision: a hard rule or the
+    critique loop replacing it. The agent's own words stay untouched in
+    `critique_rounds`; this row is the replacement and its justification."""
+
+    round_no: int
+    kind: str  # hard_rule_review | hard_rule_reject | critic_escalation | critic_exhausted
+    from_status: ApprovalStatus
+    to_status: ApprovalStatus
+    reasoning: str
+    created_at: str = ""
+
+
+class HumanReview(BaseModel):
+    """One person acting on a run in the dashboard — confirm or overturn."""
+
+    reviewed_at: str
+    reviewer: str = "dashboard"
+    action: str  # confirm | override_approve | override_reject
+    from_status: FinalStatus
+    to_status: FinalStatus
+    note: str = ""
 
 
 class InvoiceRunResult(BaseModel):
@@ -263,6 +302,15 @@ class InvoiceRunResult(BaseModel):
     payment: PaymentResult | None = None
     error: str = ""
     trace: list[TraceEvent] = Field(default_factory=list)
+    # 2, 3, ... when this same document (by content) was processed before —
+    # the CLI surfaces it as a non-blocking reprocessing notice.
+    document_run_no: int = 1
+    # System overrides of agent decisions, in order. The decisions themselves
+    # stay verbatim in critique_rounds; these are what replaced them and why.
+    overrides: list[OverrideRecord] = Field(default_factory=list)
+    # Every person who acted on this run, newest last. The agents' output is
+    # never edited by a review; the effective status is derived instead.
+    human_reviews: list[HumanReview] = Field(default_factory=list)
     # Set when a person acts on the run in the dashboard — overturning it or
     # confirming it as it stands. Empty means no human has looked at it yet,
     # which is what lets the UI count outstanding auto-rejections.

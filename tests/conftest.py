@@ -31,7 +31,11 @@ def fake_brain(ground_truth) -> FakeBrain:
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    return Settings(db_path=tmp_path / "inventory.db", results_dir=tmp_path / "results")
+    return Settings(
+        db_path=tmp_path / "inventory.db",
+        runs_db_path=tmp_path / "invoiceflow.db",
+        results_dir=tmp_path / "results",
+    )
 
 
 @pytest.fixture
@@ -39,6 +43,13 @@ def db(settings: Settings) -> Database:
     database = Database(settings.db_path)
     database.init()
     return database
+
+
+@pytest.fixture
+def store(settings: Settings):
+    from invoiceflow.runstore import RunStore
+
+    return RunStore(settings.runs_db_path)
 
 
 @pytest.fixture

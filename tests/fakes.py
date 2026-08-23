@@ -17,6 +17,7 @@ from typing import Any
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages.ai import UsageMetadata
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import Runnable, RunnableLambda
 from langchain_core.utils.function_calling import convert_to_openai_tool
@@ -68,6 +69,12 @@ class FakeBrain(BaseChatModel):
             msg = AIMessage(content="Running all validation checks.", tool_calls=tool_calls)
         else:
             msg = AIMessage(content="All requested checks have been executed.")
+        # Deterministic usage numbers so the telemetry path (recording.py ->
+        # llm_calls) is exercised offline exactly as a real model would drive it.
+        prompt_tokens = sum(len(m.content) for m in messages if isinstance(m.content, str)) // 4
+        msg.usage_metadata = UsageMetadata(
+            input_tokens=prompt_tokens, output_tokens=32, total_tokens=prompt_tokens + 32
+        )
         return ChatResult(generations=[ChatGeneration(message=msg)])
 
     def with_structured_output(self, schema: Any, **kwargs: Any) -> Runnable:
@@ -77,6 +84,11 @@ class FakeBrain(BaseChatModel):
                 if hasattr(prompt_value, "to_messages")
                 else list(prompt_value)
             )
+            # Route the round-trip through the chat model so callbacks fire:
+            # the real path (ChatXAI structured output) hits on_chat_model_start
+            # /on_llm_end, and the telemetry recorder must see the same events
+            # here. The generic reply is discarded; only the side effect counts.
+            self.invoke(messages)
             text = _messages_text(messages)
             if schema is Invoice:
                 return self._lookup_extraction(text)
