@@ -167,6 +167,10 @@ the flat per-stage trace in the terminal deliberately flattens away.
 It is **off by default and meant for development only**: enabling it sends
 prompts and invoice contents to LangSmith's cloud, which is exactly what "no
 external APIs beyond Grok" rules out for anything resembling real invoice data.
+The `langsmith` client is therefore declared in the **`dev` dependency group**,
+not in `[project.dependencies]` — `uv sync --no-dev` gives you a run-only
+environment, and the pipeline itself never reaches for it.
+
 Uncomment the LangSmith block in `.env` (or export the same variables) to turn
 it on for a debugging session:
 
@@ -178,7 +182,9 @@ LANGSMITH_PROJECT=invoiceflow
 
 Runs are named per invoice and tagged with the model, the CLI prints a banner
 whenever tracing is live, and the test suite forces it off
-(`tests/__init__.py`) so 61 fake-brain runs never land in a real project.
+(`tests/__init__.py`) so 61 fake-brain runs never land in a real project. The
+banner reads the same four environment variables the tracer itself does
+(`config.TRACING_ENV_VARS`), so a traced run can never look untraced.
 
 ## Project layout
 

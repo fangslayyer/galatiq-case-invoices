@@ -1041,6 +1041,7 @@ dependencies = [
 dev = [
     { name = "ipykernel" },
     { name = "jupyterlab" },
+    { name = "langsmith" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-cov" },
@@ -1065,6 +1066,7 @@ requires-dist = [
 dev = [
     { name = "ipykernel", specifier = ">=7.3.0" },
     { name = "jupyterlab", specifier = ">=4.6.3" },
+    { name = "langsmith", specifier = ">=0.11.1" },
     { name = "pyright", specifier = ">=1.1.411" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "pytest-cov", specifier = ">=7.1.0" },

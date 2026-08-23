@@ -21,6 +21,13 @@ dependencies = [
 dev = [
     "ipykernel>=7.3.0",
     "jupyterlab>=4.6.3",
+    # LangSmith trace viewer client — DEVELOPMENT ONLY. The case allows no
+    # external API beyond Grok, so tracing is opt-in per debugging session
+    # (LANGSMITH_TRACING=true) and never fires in a normal run: see
+    # config.tracing_enabled() and tests/__init__.py. langchain-core pulls the
+    # package in transitively regardless; declaring it here pins the version and
+    # marks it as ours for development, not part of the shipping pipeline.
+    "langsmith>=0.11.1",
     "pyright>=1.1.411",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",

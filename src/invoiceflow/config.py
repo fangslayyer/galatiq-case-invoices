@@ -17,6 +17,18 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 LANGSMITH_DEFAULT_PROJECT = "invoiceflow"
 
+# Every name langsmith.utils.tracing_is_enabled() consults, in its own
+# precedence order. Mirrored rather than imported: importing langsmith here
+# would drag the SDK into every CLI start-up, and its lookup is lru_cached
+# against a live os.environ. The rule below is that function's, verbatim —
+# first non-empty value wins, and it must be exactly "true".
+TRACING_ENV_VARS = (
+    "LANGSMITH_TRACING_V2",
+    "LANGCHAIN_TRACING_V2",
+    "LANGSMITH_TRACING",
+    "LANGCHAIN_TRACING",
+)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="INVOICEFLOW_", env_file=".env", extra="ignore")
@@ -46,13 +58,27 @@ def get_settings() -> Settings:
     return Settings()
 
 
+def tracing_enabled() -> bool:
+    """Whether LangSmith's tracer is live for this process.
+
+    Answers the question the same way the tracer does, so the CLI's warning
+    banner can never disagree with where the data is actually going.
+    """
+    for var in TRACING_ENV_VARS:
+        value = os.environ.get(var, "")
+        if value.strip():
+            return value == "true"
+    return False
+
+
 def langsmith_project() -> str | None:
     """The LangSmith project runs are traced to, or None when tracing is off.
 
     Development-only observability: turning it on ships prompts and invoice
     text to LangSmith's cloud, so it stays opt-in behind LANGSMITH_TRACING=true
-    and is forced off in the test suite (see tests/__init__.py).
+    (the langsmith client itself is a dev dependency) and is forced off in the
+    test suite (see tests/__init__.py).
     """
-    if os.environ.get("LANGSMITH_TRACING", "").strip().lower() != "true":
+    if not tracing_enabled():
         return None
     return os.environ.setdefault("LANGSMITH_PROJECT", LANGSMITH_DEFAULT_PROJECT)
