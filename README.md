@@ -17,7 +17,7 @@ cp .env.example .env                                       # put your XAI_API_KE
 uv run python main.py --init-db                            # create both DBs (inventory + run store)
 uv run python main.py --invoice_path=data/invoices/invoice_1001.txt
 uv run python main.py --all                                # batch: all 20 sample files
-uv run streamlit run ui/app.py                             # dashboard: upload, inbox, review
+uv run streamlit run ui/app.py                             # dashboard: upload, inbox, review, learning
 uv run python main.py --export-graph                       # re-render docs/graph.png
 uv run python main.py --export-json all                    # render runs from the DB to results/
 ```
@@ -27,6 +27,14 @@ database and upload invoices from the browser — 📤 Upload, top right. Files 
 in the **Inbox** tab and are processed in the background, one at a time, by the
 same pipeline the CLI runs. The CLI remains the product for engineers; the
 dashboard is the product for the finance team.
+
+Its **🎓 Learning** tab is worth eight clicks: it walks two vendor histories
+through the pipeline one invoice at a time, and you watch the escalations stop.
+Three approvals settle a vendor who bills in EUR; a single one settles a vendor
+whose totals sit two cents off, because how much history a finding needs is
+derived from what it puts at risk rather than configured as a count. Then it
+shows the system declining to apply either lesson where it does not reach —
+[data/demo/precedent/README.md](data/demo/precedent/README.md).
 
 Grok is the pipeline's only brain — there is deliberately no rule-based
 fallback parser. "Offline" in the brief means the *surrounding* systems
@@ -88,7 +96,7 @@ self-edge on `ingest`, and the `decide`/`critique` cycle is right there:
 |---|---|---|
 | **Extractor** | Messy text → structured `Invoice` (canonical item names, OCR fixes) | Self-correction loop #1, **in-agent**: schema/sanity errors fed back into the next prompt, ≤2 retries |
 | **Validator** | Interrogates the invoice against inventory & records | ReAct tool-calling loop over 5 deterministic tools |
-| **Approver** | Drafts approve / reject / needs-review with business rationale | Proposer in a reflection pair |
+| **Approver** | Drafts approve / reject / needs-review with business rationale | Proposer in a reflection pair; tool-calls `find_similar_invoices` when history could answer an open finding |
 | **Critic** | Adversarial audit against a fraud & scrutiny checklist | Self-correction loop #2, **a graph cycle**: can force revisions or escalate to a human |
 | **Payer** | Executes the mock payment or logs the rejection | Guarded tool execution (never pays twice) |
 
@@ -117,6 +125,16 @@ self-edge on `ingest`, and the `decide`/`critique` cycle is right there:
   foreign currency, revised invoices) become `needs_review` and land in the
   dashboard's escalation queue with one-click human resolution — not a forced
   guess.
+- **The escalation queue learns.** Some of what it escalates is a question about
+  a *vendor's habits*, and a handful of consistent human answers settles that
+  kind of question for good. Prior reviews become evidence the rule engine
+  weighs — enough of it, on comparable and recent invoices, and the finding is
+  discharged with its citations instead of escalated again. Six findings are
+  eligible; `unknown_item` deliberately is not, because inventory is
+  authoritative and the fix for a missing SKU is a catalog entry. Automatic
+  approvals never count as precedent, so the system can never cite itself as
+  the reason it paid. See
+  [beyond-the-brief.md §19](docs/beyond-the-brief.md#19-precedent-weighted-approval--shipped).
 - **Idempotency built in.** A processed-invoice registry fingerprints each
   invoice by canonical content, so the same invoice arriving twice — even as
   TXT once and PDF once — is caught as a duplicate and never double-paid.
@@ -146,7 +164,7 @@ self-edge on `ingest`, and the `decide`/`critique` cycle is right there:
 ## Testing & quality
 
 ```bash
-uv run pytest                      # 187 offline tests, ~20s, no API key needed
+uv run pytest                      # 249 offline tests, ~25s, no API key needed
 uv run pytest --cov=invoiceflow    # with coverage
 uv run pytest -m live              # against real Grok (needs XAI_API_KEY)
 uv run ruff check && uv run ruff format --check
@@ -206,16 +224,18 @@ src/invoiceflow/
   agents.py              Extractor / Validator / Approver / Critic prompts & loops
   validation.py          deterministic validation tools (the Validator's toolbox)
   rules.py               hard business rules constraining the Approver
+  precedent.py           learning from human review: burden, support, the Approver's tool
   models.py              Pydantic schemas for every agent's structured output
   db.py                  SQLite inventory (the mock legacy system)
-  schema.sql             invoiceflow.db DDL — 21 tables + 8 views (docs/schema.md)
+  schema.sql             invoiceflow.db DDL — 23 tables + 11 views (docs/schema.md)
   runstore.py            the system of record: documents, runs, telemetry, registry
   recording.py           per-run turn/LLM-call recorder (tokens, latency, cost)
   pipeline.py            run wrapper: Grok factory, run IDs, one-transaction persist
   cli.py                 rich terminal UI: per-stage trace, usage lines, batch summary
 ui/app.py                Streamlit dashboard: upload + inbox, runs browser, escalation queue
-tests/                   191 tests (187 offline + 4 live-marked)
+tests/                   253 tests (249 offline + 4 live-marked)
 data/invoices/           provided sample invoices (the acceptance dataset)
+data/demo/precedent/     the learning walkthrough: two vendor histories, ours not theirs
 docs/graph.png|.mmd      compiled LangGraph topology (`--export-graph` re-renders)
 docs/beyond-the-brief.md additions beyond CASE.md, and why each one earns its place
 docs/schema.md           the relational data model, with design rationale

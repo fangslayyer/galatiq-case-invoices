@@ -1,0 +1,30 @@
+{
+  "invoice_number": "INV-3001",
+  "vendor": "Fabrikam GmbH",
+  "invoice_date": "2026-03-02",
+  "due_date": "2026-04-01",
+  "due_date_raw": null,
+  "line_items": [
+    {
+      "item": "WidgetA",
+      "quantity": 8,
+      "unit_price": 200.0,
+      "line_total": 1600.0,
+      "note": null
+    },
+    {
+      "item": "WidgetB",
+      "quantity": 2,
+      "unit_price": 400.0,
+      "line_total": 800.0,
+      "note": null
+    }
+  ],
+  "subtotal": 2400.0,
+  "tax_amount": 0.0,
+  "extra_charges": 0.0,
+  "total": 2400.0,
+  "currency": "EUR",
+  "payment_terms": "Net 30",
+  "notes": "Reverse charge - VAT accounted for by the recipient."
+}

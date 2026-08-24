@@ -1,0 +1,18 @@
+NORTHWIND TRADERS
+1420 Cascade Way, Portland, OR 97209
+
+INVOICE
+
+Invoice Number: INV-4001
+Date: 2026-03-09
+Due Date: 2026-04-08
+
+Item        Qty    Unit Price    Amount
+WidgetA     4      $250.00       $1,000.00
+WidgetB     2      $500.00       $1,000.00
+
+Subtotal:        $2,000.00
+Sales tax 8.5%:  $170.00
+Total Due:       $2,170.02
+
+Payment Terms: Net 30

@@ -156,18 +156,21 @@ class TestApprovalAgents:
     def test_approver_rejects_on_must_reject(self):
         inv, rep = make_invoice(), make_report(critical())
         c = evaluate_rules(inv, rep, 10_000)
-        decision = run_approver(self.llm, inv, rep, c)
+        decision, consulted = run_approver(self.llm, inv, rep, c)
         assert decision.status == ApprovalStatus.REJECTED
+        # No tools offered, so none called — and the Approver's request is the
+        # same shape it was before precedent existed.
+        assert consulted == []
 
     def test_approver_escalates_on_warnings(self):
         inv, rep = make_invoice(), make_report(warning())
         c = evaluate_rules(inv, rep, 10_000)
-        assert run_approver(self.llm, inv, rep, c).status == ApprovalStatus.NEEDS_REVIEW
+        assert run_approver(self.llm, inv, rep, c)[0].status == ApprovalStatus.NEEDS_REVIEW
 
     def test_approver_notes_scrutiny_on_high_value(self):
         inv, rep = make_invoice(total=15_000.0), make_report()
         c = evaluate_rules(inv, rep, 10_000)
-        decision = run_approver(self.llm, inv, rep, c)
+        decision, _ = run_approver(self.llm, inv, rep, c)
         assert decision.status == ApprovalStatus.APPROVED
         assert "scrutiny" in decision.reasoning.lower()
 

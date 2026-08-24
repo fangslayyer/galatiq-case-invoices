@@ -375,3 +375,78 @@ def test_the_inbox_renders_finished_and_queued_rows_together(
     assert not [r for r in caplog.records if "Arrow" in r.getMessage()], (
         "a mixed-type column forced Streamlit to repair the table"
     )
+
+
+# ---------------------------------------------------------------------------
+# The Learning tab
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def learning_dashboard(settings, db, fake_brain, monkeypatch) -> RunStore:
+    """A dashboard where one demo invoice has been settled by a person, so the
+    walkthrough has a completed step and the learned table has a row."""
+    from invoiceflow.review import apply_human_review
+    from tests.conftest import DEMO_DIR
+
+    _export(monkeypatch, settings)
+    pipe = Pipeline(settings, llm=fake_brain)
+    first = pipe.run(DEMO_DIR / "invoice_4001.txt")
+    assert first.final_status == FinalStatus.NEEDS_REVIEW
+    apply_human_review(pipe.store, first, approve=True, note="known rounding", reviewer="demo")
+    return pipe.store
+
+
+def test_learning_tab_renders_on_an_empty_database(empty_dashboard):
+    """A fresh install has learned nothing, which must read as a starting point
+    rather than as a broken panel."""
+    at = AppTest.from_file(APP, default_timeout=60).run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert any("Nothing learned yet" in i.value for i in at.info)
+
+
+def test_learning_tab_shows_what_a_person_settled(learning_dashboard):
+    at = AppTest.from_file(APP, default_timeout=60).run()
+    assert not at.exception, [e.value for e in at.exception]
+    learned = learning_dashboard.learned_precedent()
+    assert len(learned) == 1
+    assert learned[0]["code"] == "total_mismatch"
+    assert learned[0]["approvals"] == 1
+    # The walkthrough offers the next invoice in that track, and only that one.
+    keys = {b.key for b in at.button}
+    assert "demo-INV-4002" in keys
+    assert "demo-INV-4003" not in keys  # locked behind the one before it
+
+
+def test_walkthrough_will_not_run_ahead_of_the_person(settings, db, fake_brain, monkeypatch):
+    """The human step is the demo, so an undecided invoice blocks the track —
+    otherwise the whole thing collapses into eight items in the review queue."""
+    from tests.conftest import DEMO_DIR
+
+    _export(monkeypatch, settings)
+    pipe = Pipeline(settings, llm=fake_brain)
+    pipe.run(DEMO_DIR / "invoice_4001.txt")  # left needing review, deliberately
+
+    at = AppTest.from_file(APP, default_timeout=60).run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert not any(b.key.startswith("demo-INV-40") for b in at.button)
+    assert any("INV-4001 is waiting on you" in i.value for i in at.info)
+
+
+def test_a_released_run_says_which_humans_released_it(settings, db, fake_brain, monkeypatch):
+    from invoiceflow.review import apply_human_review
+    from tests.conftest import DEMO_DIR
+
+    _export(monkeypatch, settings)
+    pipe = Pipeline(settings, llm=fake_brain)
+    first = pipe.run(DEMO_DIR / "invoice_4001.txt")
+    apply_human_review(pipe.store, first, approve=True, reviewer="demo")
+    settled = pipe.run(DEMO_DIR / "invoice_4002.csv")
+    assert settled.final_status == FinalStatus.PAID
+
+    at = AppTest.from_file(APP, default_timeout=60).run()
+    assert not at.exception, [e.value for e in at.exception]
+    at.button(key=f"toggle-{settled.run_id}").click().run()
+    rendered = " ".join(m.value for m in at.markdown)
+    assert "1 prior approval(s) settled" in rendered
+    assert "review discharged" in rendered

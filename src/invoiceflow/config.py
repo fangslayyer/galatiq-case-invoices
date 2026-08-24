@@ -64,6 +64,18 @@ class Settings(BaseSettings):
     max_extraction_retries: int = 2
     max_critique_rounds: int = 2
 
+    # Learning from human review (precedent.py). Only two knobs, and neither is
+    # a threshold count: how much history a finding needs is derived from what
+    # that finding puts at risk, not configured. The weight tables live in code
+    # beside the reasoning for each number — they are policy, not deployment
+    # configuration, and a number nobody can find the argument for is a number
+    # nobody should be able to change from an .env file.
+    precedent_enabled: bool = True
+    #: Past this, a prior decision still counts but at reduced weight. Habits go
+    #: stale: vendors change billing systems, and a rate somebody accepted two
+    #: years ago is not this year's rate.
+    precedent_max_age_days: int = 180
+
     def resolve_api_key(self) -> str:
         return self.xai_api_key
 

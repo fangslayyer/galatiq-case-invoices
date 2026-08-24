@@ -17,6 +17,7 @@ then becomes a run the two queues above can act on.
 Run with:  uv run streamlit run ui/app.py
 """
 
+import sqlite3
 from pathlib import Path
 
 import streamlit as st
@@ -90,6 +91,36 @@ def in_flight(result: InvoiceRunResult) -> bool:
     """
     return not result.finished_at
 
+
+#: The learning walkthrough: two vendor histories, run one invoice at a time.
+#: The full story, including the arithmetic, is in the directory's own README.
+DEMO_DIR = PROJECT_ROOT / "data" / "demo" / "precedent"
+DEMO_TRACKS: list[tuple[str, str, list[tuple[str, str]]]] = [
+    (
+        "Track A — Fabrikam GmbH bills in EUR",
+        "A hard review rule today. Three human approvals settle it; the fourth "
+        "invoice is paid without anyone being asked, and the fifth is far too "
+        "large for what those approvals established.",
+        [
+            ("invoice_3001.txt", "INV-3001"),
+            ("invoice_3002.json", "INV-3002"),
+            ("invoice_3003.csv", "INV-3003"),
+            ("invoice_3004.xml", "INV-3004"),
+            ("invoice_3005.txt", "INV-3005"),
+        ],
+    ),
+    (
+        "Track B — Northwind Traders round each line",
+        "Their totals sit two cents off. Almost nothing is at risk, so one "
+        "human answer is enough — and still does not cover the $412 gap on the "
+        "third, which the machine's own approval does nothing to excuse.",
+        [
+            ("invoice_4001.txt", "INV-4001"),
+            ("invoice_4002.csv", "INV-4002"),
+            ("invoice_4003.json", "INV-4003"),
+        ],
+    ),
+]
 
 #: st.session_state is new to this app and used only where a local cannot work.
 #: @st.dialog wraps its body in a fragment, so a widget inside the modal reruns
@@ -179,6 +210,30 @@ def render_verdicts(result: InvoiceRunResult) -> None:
             verdict("Payment", f"paid ${pay.amount:,.2f} to {pay.vendor}", "green")
         else:
             verdict("Payment", f"declined, ${pay.amount:,.2f} not sent", "red")
+
+    for cite in store.citations_for(result.run_id):
+        # What history was asked, and what it answered. Rendered even when it
+        # answered "not enough" — an escalation nobody can account for is the
+        # thing this whole feature is supposed to stop producing.
+        about = f"`{cite['code']}`" + (f" '{cite['subject']}'" if cite["subject"] else "")
+        if cite["released"]:
+            verdict(
+                "Precedent",
+                f"{cite['cases']} prior approval(s) settled {about} — "
+                f"support {cite['support']:.2f} vs burden {cite['burden']:.2f}, "
+                "review discharged",
+                "green",
+            )
+        elif cite["blocked_by"]:
+            verdict("Precedent", f"{about} — {cite['blocked_by']}", "orange")
+        elif cite["cases"] or cite["rejections"]:
+            verdict(
+                "Precedent",
+                f"{cite['cases']} prior approval(s) on {about}, not enough — "
+                f"support {cite['support']:.2f} against a burden of {cite['burden']:.2f}"
+                + (f"; {cite['rejections']} prior rejection(s)" if cite["rejections"] else ""),
+                "orange",
+            )
 
     for hr in result.human_reviews:
         verdict("Human review", hr.action.replace("_", " "), "blue")
@@ -502,11 +557,20 @@ pending = inbox_counts.get("queued", 0) + inbox_counts.get("processing", 0)
 # starts and, via the st.rerun() at the end of the fragment, stops.
 refresh = 2.0 if pending else None
 
-tab_inbox, tab_queue, tab_rejected, tab_runs, tab_db = st.tabs(
+learned = store.learned_precedent()
+#: Latest run per invoice number. `load_results` is newest-first, so the first
+#: sighting of a number is its current run — later ones are superseded.
+latest_by_number: dict[str, InvoiceRunResult] = {}
+for r in results:
+    if r.invoice is not None:
+        latest_by_number.setdefault(r.invoice.invoice_number, r)
+
+tab_inbox, tab_queue, tab_rejected, tab_learning, tab_runs, tab_db = st.tabs(
     [
         f"📥 Inbox ({pending} in flight)" if pending else "📥 Inbox",
         f"🟡 Needs review ({len(queue)})" if queue else "🟡 Needs review",
         f"⛔ Rejected ({unchecked} unchecked)" if unchecked else "⛔ Rejected",
+        f"🎓 Learning ({len(learned)})" if learned else "🎓 Learning",
         "📚 All runs",
         "🗄 Database",
     ]
@@ -579,6 +643,126 @@ with tab_rejected:
         with st.container(border=True):
             st.subheader(run_header(result) + mark)
             render_run(result, actionable=True, scope="rejected")
+
+with tab_learning:
+    st.caption(
+        "Findings a person has settled often enough that the pipeline stops asking. "
+        "Only human decisions count — an automatic approval is never evidence for the next one."
+    )
+    if not learned:
+        st.info(
+            "Nothing learned yet. Every finding somebody settles in the two queues shows up "
+            "here, and the walkthrough below is the short version of it happening."
+        )
+    else:
+        st.dataframe(
+            [
+                {
+                    "finding": row["code"],
+                    "about": row["subject"] or "the vendor's practice",
+                    "vendor": row["vendor"],
+                    "approved by a person": row["approvals"],
+                    "rejected by a person": row["rejections"],
+                    "largest approved": f"{row['largest_approved']:,.2f}"
+                    if row["largest_approved"]
+                    else "—",
+                    "last reviewed": (row["last_reviewed_at"] or "")[:16].replace("T", " "),
+                    "invoices": row["invoices"] or "",
+                }
+                for row in learned
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+
+    st.divider()
+    st.markdown("#### Walkthrough")
+    st.caption(
+        "Eight invoices, all legitimate, none clean. One runs at a time and the next unlocks "
+        "when you have dealt with the last — that step is the demo. Full arithmetic in "
+        "`data/demo/precedent/README.md`."
+    )
+    if not DEMO_DIR.exists():
+        st.warning(f"The demo invoices are missing from {DEMO_DIR}.")
+
+    def demo_row(number: str) -> tuple[str, str, bool]:
+        """(badge, note, resolved) for one demo invoice."""
+        result = latest_by_number.get(number)
+        if result is None:
+            return "⚪ not run", "", False
+        if in_flight(result):
+            return IN_FLIGHT_BADGE, "", False
+        badge = STATUS_BADGE[result.final_status]
+        cite = next(iter(store.citations_for(result.run_id)), None)
+        if cite is None:
+            note = ""
+        elif cite["released"]:
+            note = (
+                f"decided by the pipeline on {cite['cases']} prior human approval(s) — "
+                f"support {cite['support']:.2f} vs burden {cite['burden']:.2f}"
+            )
+        elif cite["blocked_by"]:
+            note = cite["blocked_by"]
+        else:
+            note = (
+                f"history fell short: support {cite['support']:.2f} against a burden of "
+                f"{cite['burden']:.2f}"
+            )
+        if result.human_reviews:
+            note = f"a person {result.human_reviews[-1].action.replace('_', ' ')}d it. " + note
+        # Resolved means "you have done your part", not "it went well": a
+        # rejection unlocks the next invoice exactly as an approval does.
+        resolved = result.final_status in (FinalStatus.PAID, FinalStatus.REJECTED)
+        return badge, note, resolved
+
+    for title, blurb, files in DEMO_TRACKS:
+        with st.container(border=True):
+            st.markdown(f"**{title}**")
+            st.caption(blurb)
+            next_up: tuple[str, str] | None = None
+            blocked_on: str | None = None
+            for filename, number in files:
+                badge, note, resolved = demo_row(number)
+                started = number in latest_by_number
+                cols = st.columns([1.4, 1.2, 4.4], vertical_alignment="center")
+                cols[0].markdown(badge)
+                cols[1].markdown(f"`{number}`")
+                cols[2].caption(note or filename)
+                if not started and next_up is None and blocked_on is None:
+                    next_up = (filename, number)
+                if started and not resolved and blocked_on is None:
+                    blocked_on = number
+            if blocked_on:
+                st.info(
+                    f"{blocked_on} is waiting on you — decide it in 🟡 Needs review, then come "
+                    "back. Its answer is what the next invoice is weighed against."
+                )
+            elif next_up is None:
+                st.success("Track complete.")
+            elif pending:
+                st.caption("Something is already processing — the Inbox tab has it.")
+            else:
+                filename, number = next_up
+                if st.button(f"▶ Process {number}", key=f"demo-{number}", type="primary"):
+                    probe = inbox.probe_upload(store, DEMO_DIR / filename)
+                    if not probe.readable:
+                        st.error(f"{filename} cannot be read. {probe.error}")
+                    else:
+                        try:
+                            inbox.enqueue(store, probe, source="samples")
+                        except sqlite3.IntegrityError:
+                            # stored_path is UNIQUE, and dismissing an inbox row
+                            # keeps it. Re-running the walkthrough is a database
+                            # reset, which is the honest answer for a demo whose
+                            # whole subject is accumulated history.
+                            st.error(
+                                f"{filename} has been queued before. Start the walkthrough "
+                                "over with `python main.py --reset-db --init-db`."
+                            )
+                        else:
+                            if worker is not None:
+                                worker.wake()
+                            st.rerun()
 
 with tab_runs:
     if not results:

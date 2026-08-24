@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 from langchain_core.tools import BaseTool, tool
 
 from .db import Database
-from .models import FinalStatus, Invoice, IssueCode, Severity, ValidationIssue
+from .models import FinalStatus, Invoice, IssueCode, LineItem, Severity, ValidationIssue
 from .prompts import Tag
 
 if TYPE_CHECKING:
@@ -44,8 +44,16 @@ class ValidationContext:
     issues: list[ValidationIssue] = field(default_factory=list)
     tools_used: list[str] = field(default_factory=list)
 
-    def add_issue(self, code: IssueCode, severity: Severity, detail: str) -> None:
-        self.issues.append(ValidationIssue(code=code, severity=severity, detail=detail))
+    def add_issue(
+        self, code: IssueCode, severity: Severity, detail: str, subject: str = ""
+    ) -> None:
+        """Record a finding. `subject` names the thing it is about — the item,
+        the currency, the invoice number — and stays empty when the finding is
+        about the vendor's practice rather than any one value on the page. It is
+        the key precedent is matched on (see precedent.py)."""
+        self.issues.append(
+            ValidationIssue(code=code, severity=severity, detail=detail, subject=subject)
+        )
 
     def report(self, tool_name: str, since: int) -> str:
         """Close out a check: record that it ran, and render what it found.
@@ -103,12 +111,14 @@ def check_inventory(ctx: ValidationContext) -> None:
                 IssueCode.UNKNOWN_ITEM,
                 Severity.WARNING,
                 f"'{item}' is not in the inventory database",
+                subject=item,
             )
         elif record.stock == 0:
             ctx.add_issue(
                 IssueCode.OUT_OF_STOCK,
                 Severity.CRITICAL,
                 f"'{item}' has zero stock (ordered {invoice_qty})",
+                subject=item,
             )
         elif invoice_qty > record.stock:
             ctx.add_issue(
@@ -116,7 +126,47 @@ def check_inventory(ctx: ValidationContext) -> None:
                 Severity.CRITICAL,
                 f"'{item}' total ordered quantity {invoice_qty} "
                 f"exceeds available stock {record.stock}",
+                subject=item,
             )
+
+
+# -- arithmetic, as three reusable gaps --------------------------------------
+#
+# Named functions rather than a single pass inside the check, because how far an
+# invoice's arithmetic is off is asked twice: here, to raise the finding, and by
+# precedent.py, to price it — a two-cent drift and a four-hundred-dollar one are
+# the same finding and nothing like the same risk. Two implementations of one
+# formula would eventually disagree about money, so there is one.
+
+
+def computed_subtotal(invoice: Invoice) -> float:
+    """The line values we can actually compute. A line with no stated unit price
+    contributes nothing — it is unknown, not zero."""
+    return sum(
+        li.quantity * li.unit_price for li in invoice.line_items if li.unit_price is not None
+    )
+
+
+def line_total_gap(li: LineItem) -> float:
+    """How far a stated line total sits from quantity x unit price."""
+    if li.unit_price is None or li.line_total is None:
+        return 0.0
+    return abs(li.line_total - li.quantity * li.unit_price)
+
+
+def subtotal_gap(invoice: Invoice) -> float:
+    """How far the stated subtotal sits from the line values."""
+    if invoice.subtotal is None:
+        return 0.0
+    return abs(invoice.subtotal - computed_subtotal(invoice))
+
+
+def total_gap(invoice: Invoice) -> float:
+    """How far the stated grand total sits from subtotal + tax + charges."""
+    if invoice.total is None:
+        return 0.0
+    base = invoice.subtotal if invoice.subtotal is not None else computed_subtotal(invoice)
+    return abs(invoice.total - (base + (invoice.tax_amount or 0.0) + invoice.extra_charges))
 
 
 @check
@@ -124,41 +174,37 @@ def verify_arithmetic(ctx: ValidationContext) -> None:
     """Recompute line totals, subtotal, and grand total and compare with the
     amounts the vendor stated."""
     invoice = ctx.invoice
-    computed_subtotal = 0.0
+    computed = computed_subtotal(invoice)
 
     for li in invoice.line_items:
-        if li.unit_price is None:
+        if li.unit_price is None or li.line_total is None:
             continue
-        expected = li.quantity * li.unit_price
-        computed_subtotal += expected
-        if li.line_total is not None and abs(li.line_total - expected) > MONEY_TOLERANCE:
+        if line_total_gap(li) > MONEY_TOLERANCE:
             ctx.add_issue(
                 IssueCode.LINE_TOTAL_MISMATCH,
                 Severity.WARNING,
                 f"'{li.item}': stated line total {li.line_total:.2f} != "
-                f"{li.quantity} x {li.unit_price:.2f} = {expected:.2f}",
+                f"{li.quantity} x {li.unit_price:.2f} = {li.quantity * li.unit_price:.2f}",
             )
 
-    if invoice.subtotal is not None and abs(invoice.subtotal - computed_subtotal) > MONEY_TOLERANCE:
+    if invoice.subtotal is not None and subtotal_gap(invoice) > MONEY_TOLERANCE:
         ctx.add_issue(
             IssueCode.SUBTOTAL_MISMATCH,
             Severity.WARNING,
-            f"stated subtotal {invoice.subtotal:.2f} != computed {computed_subtotal:.2f}",
+            f"stated subtotal {invoice.subtotal:.2f} != computed {computed:.2f}",
         )
 
-    if invoice.total is not None:
+    if invoice.total is not None and total_gap(invoice) > MONEY_TOLERANCE:
         expected_total = (
-            (invoice.subtotal if invoice.subtotal is not None else computed_subtotal)
+            (invoice.subtotal if invoice.subtotal is not None else computed)
             + (invoice.tax_amount or 0.0)
             + invoice.extra_charges
         )
-        if abs(invoice.total - expected_total) > MONEY_TOLERANCE:
-            ctx.add_issue(
-                IssueCode.TOTAL_MISMATCH,
-                Severity.WARNING,
-                f"stated total {invoice.total:.2f} != "
-                f"subtotal + tax + charges = {expected_total:.2f}",
-            )
+        ctx.add_issue(
+            IssueCode.TOTAL_MISMATCH,
+            Severity.WARNING,
+            f"stated total {invoice.total:.2f} != subtotal + tax + charges = {expected_total:.2f}",
+        )
 
 
 @check
@@ -179,6 +225,7 @@ def check_integrity(ctx: ValidationContext) -> None:
                 IssueCode.NEGATIVE_QUANTITY,
                 Severity.CRITICAL,
                 f"'{li.item}' has negative quantity {li.quantity}",
+                subject=li.item,
             )
     if invoice.total is None:
         # An absent total is a hole, not a finding: every other total check
@@ -213,10 +260,14 @@ def check_integrity(ctx: ValidationContext) -> None:
         )
 
     if invoice.currency.upper() != ctx.expected_currency.upper():
+        # Subject is the currency, not the invoice: "do we settle this vendor in
+        # EUR?" is a standing question about the relationship, and it is the same
+        # question every time they bill in it.
         ctx.add_issue(
             IssueCode.UNEXPECTED_CURRENCY,
             Severity.WARNING,
             f"invoice currency is {invoice.currency}, expected {ctx.expected_currency}",
+            subject=invoice.currency.upper(),
         )
 
 
@@ -262,6 +313,7 @@ def check_duplicate(ctx: ValidationContext) -> None:
             Severity.CRITICAL,
             f"{inv.invoice_number} was already processed "
             f"(status: {prior.final_status}) with identical content",
+            subject=inv.invoice_number,
         )
     elif prior.final_status == FinalStatus.PAID:
         # Money has already moved on this invoice number, so the revision
@@ -274,6 +326,7 @@ def check_duplicate(ctx: ValidationContext) -> None:
             IssueCode.REVISION_OF_PAID_INVOICE,
             Severity.WARNING,
             _revision_of_paid_detail(inv.invoice_number, prior.total, inv.total),
+            subject=inv.invoice_number,
         )
     else:
         # Nothing was paid, so a corrected invoice replacing a rejected one is
@@ -283,6 +336,7 @@ def check_duplicate(ctx: ValidationContext) -> None:
             Severity.WARNING,
             f"{inv.invoice_number} was already processed (status: {prior.final_status}) "
             "but the content differs — this looks like a revised invoice",
+            subject=inv.invoice_number,
         )
 
 

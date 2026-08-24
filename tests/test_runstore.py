@@ -12,8 +12,55 @@ import pytest
 
 from invoiceflow.models import FinalStatus, IssueCode
 from invoiceflow.pipeline import export_result_json
-from invoiceflow.runstore import ISSUE_CATEGORIES, SCHEMA_PATH
+from invoiceflow.runstore import (
+    ISSUE_CATEGORIES,
+    SCHEMA_PATH,
+    RunStore,
+    _created_object,
+    _statements,
+)
 from tests.conftest import INVOICES_DIR
+
+#: Everything the precedent feature added to the schema, for the growth test.
+PRECEDENT_OBJECTS = {
+    "precedent_citations",
+    "v_review_precedent",
+    "v_precedent_learning",
+    "idx_issues_subject",
+}
+
+
+def _pre_precedent_schema() -> str:
+    """schema.sql as it stood before any of this existed.
+
+    Reconstructed from the current file rather than pasted in: a copy of the old
+    DDL would rot the moment anything unrelated changed, and then this test
+    would be exercising a database shape nobody ever had.
+    """
+    script = "".join(
+        statement
+        for statement in _statements(SCHEMA_PATH.read_text())
+        if _created_object(statement) not in PRECEDENT_OBJECTS
+    )
+    before = script
+    script = script.replace("    subject   TEXT    NOT NULL DEFAULT '',\n", "")
+    script = script.replace(
+        "CHECK (kind IN\n"
+        "                           ('reject','review','scrutiny','advisory','precedent'))",
+        "CHECK (kind IN ('reject','review','scrutiny','advisory'))",
+    )
+    assert script != before, "the schema no longer contains what this test rolls back"
+    return script
+
+
+def _object_shapes_of(store) -> dict[str, str]:
+    with store.connect() as conn:
+        return {
+            name: re.sub(r"\s+", " ", sql).strip()
+            for name, sql in conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL"
+            )
+        }
 
 
 def _object_shapes(script: str) -> dict[str, str]:
@@ -45,6 +92,59 @@ class TestSchema:
             if doc_shapes[name] != sql_shapes[name] and name not in declared_amendments
         }
         assert not drifted, f"schema.sql drifted from docs/schema.md: {sorted(drifted)}"
+
+    def test_a_schema_change_reaches_a_database_that_already_exists(self, tmp_path):
+        """Same argument as the issue_codes re-seed below, one level up. A
+        column, a table, a view and a widened CHECK all arrived with precedent;
+        a database created before them has to grow them on open, or the first
+        run to need one dies on a real invoice — and takes an audit trail with
+        it if the answer is "recreate the database"."""
+        path = tmp_path / "older.db"
+        conn = sqlite3.connect(path)
+        conn.executescript(_pre_precedent_schema())
+        conn.execute(
+            "INSERT INTO runs (run_id, source_path, started_at, final_status) "
+            "VALUES ('older-0001', 'x.txt', '2026-01-01T00:00:00+00:00', 'paid')"
+        )
+        conn.execute(
+            "INSERT INTO rule_evaluations (run_id, must_reject, must_review, "
+            "requires_scrutiny, scrutiny_threshold) VALUES (1, 0, 0, 0, 10000)"
+        )
+        conn.execute(
+            "INSERT INTO rule_reasons (rule_evaluation_id, kind, reason) "
+            "VALUES (1, 'advisory', 'something older')"
+        )
+        conn.commit()
+        conn.close()
+
+        store = RunStore(path)  # opening it is what grows the schema
+
+        with store.connect() as conn:
+            names = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master")}
+            assert names >= PRECEDENT_OBJECTS
+            columns = {r[1] for r in conn.execute("PRAGMA table_info(validation_issues)")}
+            assert "subject" in columns
+            # The rebuilt table kept every row it had...
+            kept = conn.execute("SELECT reason FROM rule_reasons").fetchall()
+            assert [r["reason"] for r in kept] == ["something older"]
+            # ...and accepts the kind the old CHECK forbade.
+            conn.execute(
+                "INSERT INTO rule_reasons (rule_evaluation_id, kind, reason) "
+                "VALUES (1, 'precedent', 'settled by precedent')"
+            )
+
+    def test_growing_the_schema_twice_changes_nothing(self, tmp_path):
+        """Every step is conditional, so a second open must not rebuild a table
+        that is already current — that is how a rebuild loses rows."""
+        path = tmp_path / "older.db"
+        conn = sqlite3.connect(path)
+        conn.executescript(_pre_precedent_schema())
+        conn.close()
+
+        first = _object_shapes_of(RunStore(path))
+        again = _object_shapes_of(RunStore(path))
+        assert first == again
+        assert not any(name.endswith("__new") for name in first)
 
     def test_a_new_issue_code_reaches_an_existing_database(self, store):
         """Adding an IssueCode must not require a hand-written migration.

@@ -28,10 +28,12 @@ from .models import (
     FinalStatus,
     OverrideRecord,
     PaymentStatus,
+    PrecedentBundle,
     TraceEvent,
     ValidationReport,
 )
 from .payment import execute_payment
+from .precedent import build_precedent_tool, lookup_precedents, precedent_block
 from .recording import RunRecorder
 from .rules import evaluate_rules
 from .runstore import RunStore
@@ -51,6 +53,20 @@ def _ev(stage: str, event: str, detail: str = "") -> TraceEvent:
         detail=detail,
         at=datetime.now(UTC).isoformat(timespec="seconds"),
     )
+
+
+def _precedent_events(bundle: PrecedentBundle) -> list[TraceEvent]:
+    """One trace line per open question history was asked about.
+
+    A refusal to release is traced as loudly as a release: "history fell short by
+    0.6" is the line that explains an escalation nobody could otherwise account
+    for, and over many runs it is the measure of whether this is worth its weight.
+    """
+    events = []
+    for found in bundle.findings:
+        event = "precedent:released" if found.released else "precedent:insufficient"
+        events.append(_ev("approval", event, found.summary_line()))
+    return events
 
 
 def _recorder(state: PipelineState) -> RunRecorder:
@@ -177,9 +193,21 @@ def build_graph(settings: Settings, db: Database, store: RunStore, llm: BaseChat
         return {"report": report, "trace": trace}
 
     def decide(state: PipelineState) -> dict:
+        trace: list[TraceEvent] = []
+        # Resolved once and cached in state: a redraft round must be judged
+        # against the same history as the first draft, and re-querying between
+        # rounds would let a concurrent review change the answer mid-decision.
+        precedents = state.get("precedents")
+        if precedents is None:
+            precedents = lookup_precedents(store, state["invoice"], state["report"], settings)
+            trace.extend(_precedent_events(precedents))
         constraints = state.get("constraints") or evaluate_rules(
-            state["invoice"], state["report"], settings.scrutiny_threshold
+            state["invoice"], state["report"], settings.scrutiny_threshold, precedents
         )
+        # Offered only where history has something to say. On everything else the
+        # Approver runs exactly as it did before precedent existed — no bound
+        # schema, no extra round-trip (see run_approver).
+        tools = [build_precedent_tool(precedents)] if precedents.has_cases else None
         rounds = state.get("critique_rounds") or []
         feedback = rounds[-1].critique.feedback if rounds else None
         rec = _recorder(state)
@@ -191,15 +219,32 @@ def build_graph(settings: Settings, db: Database, store: RunStore, llm: BaseChat
             # recorded as a self-FK on the spine, not inferred from round_no.
             triggered_by=rec.last_seq("critic") if feedback else None,
         ):
-            decision = run_approver(llm, state["invoice"], state["report"], constraints, feedback)
-        trace = [
+            decision, consulted = run_approver(
+                llm, state["invoice"], state["report"], constraints, feedback, tools
+            )
+        if tools:
+            trace.append(
+                _ev("approval", "precedent:consulted", ", ".join(consulted))
+                if consulted
+                else _ev(
+                    "approval",
+                    "precedent:declined",
+                    "the Approver was offered precedent and did not open it",
+                )
+            )
+        trace.append(
             _ev(
                 "approval",
                 f"proposed:{decision.status}",
                 decision.reasoning + (" [revision after critique]" if feedback else ""),
             )
-        ]
-        return {"constraints": constraints, "decision": decision, "trace": trace}
+        )
+        return {
+            "constraints": constraints,
+            "decision": decision,
+            "precedents": precedents,
+            "trace": trace,
+        }
 
     def critique(state: PipelineState) -> dict:
         decision = state["decision"]
@@ -212,7 +257,17 @@ def build_graph(settings: Settings, db: Database, store: RunStore, llm: BaseChat
             round_no=rounds_so_far + 1,
             triggered_by=rec.last_seq("approver"),
         ):
-            crit = run_critic(llm, state["invoice"], state["report"], constraints, decision)
+            # The same block the Approver was given, so a citation can be
+            # checked rather than taken on trust. Empty when it had none.
+            precedents = state.get("precedents")
+            evidence = (
+                precedent_block(precedents)
+                if precedents is not None and precedents.has_cases
+                else ""
+            )
+            crit = run_critic(
+                llm, state["invoice"], state["report"], constraints, decision, evidence
+            )
         trace = [_ev("approval", f"critique:{crit.verdict}", crit.feedback)]
         exhausted = (
             crit.verdict == CritiqueVerdict.REVISE

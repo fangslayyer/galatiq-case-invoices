@@ -158,6 +158,14 @@ def _fake_decision(text: str) -> ApprovalDecision:
             "High-value invoice given additional scrutiny (" + "; ".join(scrutiny) + "). "
             "No discrepancies found; approving for payment."
         )
+    # Note what this does NOT do: nothing here reads the tool transcript to
+    # decide anything. Discharged findings never reach `advisory_warnings` in
+    # the first place, so the deterministic policy above approves for the same
+    # reason a real model should — the question is answered, not merely
+    # explained away. Naming the citation keeps the reasoning honest about why.
+    discharged = constraints.get("precedent_discharged", [])
+    if discharged:
+        reasoning += " Already settled by prior human decisions: " + "; ".join(discharged)
     return ApprovalDecision(status=ApprovalStatus.APPROVED, reasoning=reasoning)
 
 

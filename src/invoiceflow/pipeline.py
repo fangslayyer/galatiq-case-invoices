@@ -162,6 +162,7 @@ class Pipeline:
             overrides=state.get("overrides", []),
             payment=state.get("payment"),
             trace=state.get("trace", []),
+            precedents=state.get("precedents"),
         )
         log.info("run %s: recorded in %s", run_id, self.store.path)
 

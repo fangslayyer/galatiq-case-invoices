@@ -1,0 +1,17 @@
+field,value
+invoice_number,INV-4002
+vendor,Northwind Traders
+date,2026-04-13
+due_date,2026-05-13
+item,WidgetA
+quantity,5
+unit_price,250.00
+amount,1250.00
+item,WidgetB
+quantity,3
+unit_price,500.00
+amount,1500.00
+subtotal,2750.00
+tax,233.75
+total,2983.78
+payment_terms,Net 30

@@ -1,0 +1,20 @@
+{
+  "invoice_number": "INV-3002",
+  "vendor": {
+    "name": "Fabrikam GmbH",
+    "address": "Rosenheimer Strasse 14, 81669 Munchen, Germany"
+  },
+  "date": "2026-04-06",
+  "due_date": "2026-05-06",
+  "currency": "EUR",
+  "line_items": [
+    {"item": "WidgetA", "quantity": 8, "unit_price": 200.00, "amount": 1600.00},
+    {"item": "WidgetB", "quantity": 4, "unit_price": 400.00, "amount": 1600.00}
+  ],
+  "subtotal": 3200.00,
+  "tax_rate": 0.0,
+  "tax_amount": 0.00,
+  "total": 3200.00,
+  "payment_terms": "Net 30",
+  "notes": "Reverse charge - VAT accounted for by the recipient."
+}

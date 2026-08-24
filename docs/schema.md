@@ -320,6 +320,12 @@ CREATE TABLE validation_issues (
     code      TEXT    NOT NULL REFERENCES issue_codes(code),
     severity  TEXT    NOT NULL CHECK (severity IN ('info','warning','critical')),
     detail    TEXT    NOT NULL,
+    -- What the finding is *about*: the item, the currency, the invoice
+    -- number. Empty when it is about the vendor's practice as such —
+    -- arithmetic drift and dating quirks belong to the vendor, not to any
+    -- one value on the page. This is the key precedent is matched on, so a
+    -- finding can be compared with history without parsing `detail`'s prose.
+    subject   TEXT    NOT NULL DEFAULT '',
     -- 'tool' issues carry authority over routing; 'agent' issues are advisory
     -- (ValidatorSummary demotes them). Today that distinction survives only as
     -- the code 'agent_observation'; here it is a column you can filter on.
@@ -347,7 +353,8 @@ CREATE TABLE rule_evaluations (
 CREATE TABLE rule_reasons (
     id                 INTEGER PRIMARY KEY,
     rule_evaluation_id INTEGER NOT NULL REFERENCES rule_evaluations(id) ON DELETE CASCADE,
-    kind               TEXT    NOT NULL CHECK (kind IN ('reject','review','scrutiny','advisory')),
+    kind               TEXT    NOT NULL CHECK (kind IN
+                           ('reject','review','scrutiny','advisory','precedent')),
     reason             TEXT    NOT NULL
 ) STRICT;
 ```
@@ -501,7 +508,57 @@ CREATE TABLE human_reviews (
     to_status   TEXT    NOT NULL,
     note        TEXT    NOT NULL DEFAULT ''
 ) STRICT;
+
+-- Which past human decisions authorized this run's automatic one. Written for
+-- every finding precedent was consulted on, released or not: a refusal to
+-- release is as much a fact about the policy as a release is.
+--
+-- `terms` holds the burden/support breakdown rather than only the two totals.
+-- That is deliberate and forward-looking: with the outcome in `human_reviews`,
+-- these rows are a labelled training set for the day the hand-set weights are
+-- replaced by a fitted model (docs/beyond-the-brief.md §19, "Day 2").
+CREATE TABLE precedent_citations (
+    id            INTEGER PRIMARY KEY,
+    run_id        INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    code          TEXT    NOT NULL REFERENCES issue_codes(code),
+    -- The question, exactly as validation_issues stated it.
+    subject       TEXT    NOT NULL DEFAULT '',
+    vendor        TEXT    NOT NULL DEFAULT '',
+    cases         INTEGER NOT NULL DEFAULT 0,   -- prior human approvals on this key
+    rejections    INTEGER NOT NULL DEFAULT 0,   -- any at all zeroes the support
+    burden        REAL    NOT NULL,             -- what had to be proven
+    support       REAL    NOT NULL,             -- what history supplied
+    released      INTEGER NOT NULL CHECK (released IN (0,1)),
+    -- Set when something barred release outright, whatever the arithmetic said
+    -- (over the scrutiny threshold, a forged prompt fence, a non-releasable code).
+    blocked_by    TEXT    NOT NULL DEFAULT '',
+    cited_run_ids TEXT    NOT NULL DEFAULT '[]' CHECK (json_valid(cited_run_ids)),
+    terms         TEXT    NOT NULL DEFAULT '{}' CHECK (json_valid(terms)),
+    UNIQUE (run_id, code, subject)
+) STRICT;
 ```
+
+`human_reviews` was write-only for its whole life: the dashboard filled it in and
+nothing ever read it back. `precedent_citations` is the other end of that loop.
+When a finding is one a vendor's habits can answer — they really do bill in EUR,
+their totals really do drift by pennies — `precedent.py` asks what people decided
+about the same question before, prices what is at risk, and the rule engine
+either stops insisting on another human or does not.
+
+Three details are load-bearing:
+
+* **`subject` on `validation_issues` is what makes the question addressable.**
+  A finding that cannot say what it is *about* can only be matched by parsing
+  the prose in `detail`, which is guesswork on the money path. It is empty for
+  findings that are about the vendor's practice rather than a value on the page.
+* **The row is written whether or not anything was released.** A refusal is as
+  much a fact about the policy as a release, and "how often does history fall
+  short, and by how much?" is the question that says whether the feature earns
+  its complexity.
+* **`terms` holds the breakdown, not just `burden` and `support`.** The weights
+  are hand-set today. With the outcome sitting in `human_reviews`, these rows are
+  a labelled dataset for the day they are fitted instead
+  ([beyond-the-brief.md](beyond-the-brief.md) §19, "Day 2").
 
 ### 4.11 The upload inbox
 
@@ -655,6 +712,46 @@ SELECT * FROM v_current_runs
 WHERE final_status = 'needs_review' AND human_reviewed_at IS NULL
 ORDER BY total DESC;
 
+-- Every finding a *person* settled, and how. The single definition of "history
+-- has an answer to this question", read by precedent.py.
+--
+-- Note what the inner joins do rather than a WHERE clause: a run with no
+-- human_reviews row simply is not here. That is the compounding guard expressed
+-- as shape — an automatically approved invoice can never become the evidence
+-- for the next automatic approval, because it has nothing to join to.
+CREATE VIEW v_review_precedent AS
+SELECT vi.code, vi.subject, i.vendor,
+       r.run_id, i.invoice_number, i.total, i.currency, vi.detail,
+       hr.action, hr.to_status, hr.reviewed_at, hr.note
+FROM validation_issues  vi
+JOIN validation_reports vr ON vr.id = vi.report_id
+JOIN runs               r  ON r.id  = vr.run_id
+JOIN invoices           i  ON i.run_id = r.id
+-- The latest review only: a run can be confirmed, reopened and overturned, and
+-- only where it finally landed is what the person actually decided.
+JOIN human_reviews      hr ON hr.id =
+     (SELECT MAX(h.id) FROM human_reviews h WHERE h.run_id = r.id)
+-- Tool-authored findings only. ValidatorSummary already demotes agent-authored
+-- issues and clears their subject; this is the second lock on a key no model
+-- may mint for itself.
+WHERE vi.origin = 'tool';
+
+-- What the pipeline has learned, per open question. Drives the Learning tab and
+-- answers "which reviews is the system now acting on by itself?" in one query.
+CREATE VIEW v_precedent_learning AS
+SELECT code, subject, vendor,
+       SUM(to_status = 'paid')     AS approvals,
+       SUM(to_status = 'rejected') AS rejections,
+       COUNT(*)                    AS decisions,
+       MAX(reviewed_at)            AS last_reviewed_at,
+       -- The largest sum a person has signed off on this key. Precedent never
+       -- reaches past it by much, so it reads as the standing's ceiling.
+       MAX(CASE WHEN to_status = 'paid' THEN total END) AS largest_approved,
+       GROUP_CONCAT(invoice_number, ', ') AS invoices
+FROM v_review_precedent
+GROUP BY code, subject, vendor
+ORDER BY approvals DESC;
+
 -- What the Inbox tab reads: every upload with the outcome of the run it
 -- produced folded in. LEFT JOINs throughout — an item that has not run yet is
 -- the normal case, not a missing row. Dismissed rows drop out here and stay in
@@ -729,6 +826,19 @@ LEFT JOIN (
 ) rev ON rev.run_id = r.id;
 ```
 
+`v_review_precedent` is worth reading twice, because the important thing about it
+is a join rather than a filter. A run reaches it only through `human_reviews`, so
+an invoice the pipeline approved by itself is not in the view at all — it has
+nothing to join to. That is the guard the whole feature rests on, and expressing
+it as shape rather than as `WHERE decided_by = 'human'` means no future query can
+forget it: without it, one approval votes for the next decision, that one votes
+for the next, and the system ends up citing itself as the reason it paid.
+
+The second join is the same kind of care at smaller stakes: `hr.id = (SELECT
+MAX(...))` takes only the *latest* review per run. A run can be confirmed,
+reopened and overturned, and only where it finally landed is what the person
+actually decided.
+
 ---
 
 ## 6. Indexes
@@ -746,6 +856,8 @@ CREATE INDEX idx_invoices_number      ON invoices(invoice_number);
 CREATE INDEX idx_invoices_hash        ON invoices(content_hash);
 CREATE INDEX idx_issues_report        ON validation_issues(report_id);
 CREATE INDEX idx_issues_code          ON validation_issues(code, severity);
+-- The precedent lookup's driving predicate: one question, across all history.
+CREATE INDEX idx_issues_subject       ON validation_issues(code, subject);
 CREATE INDEX idx_overrides_run        ON decision_overrides(run_id);
 CREATE INDEX idx_overrides_invocation ON decision_overrides(invocation_id);
 CREATE INDEX idx_human_reviews_run    ON human_reviews(run_id);

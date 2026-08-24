@@ -54,6 +54,11 @@ class RuleReasonKind(StrEnum):
     REVIEW = "review"
     SCRUTINY = "scrutiny"
     ADVISORY = "advisory"
+    #: A finding a person has already settled often enough that the rules stopped
+    #: insisting on another one. Kept apart from `advisory` deliberately: the
+    #: whole point of a discharge is that the warning is answered, and an
+    #: answered warning listed among the open ones would be re-litigated.
+    PRECEDENT = "precedent"
 
 
 class FinalStatus(StrEnum):
@@ -126,6 +131,12 @@ class ValidationIssue(BaseModel):
     code: IssueCode
     severity: Severity
     detail: str
+    #: What this finding is *about*, when it is about a thing: the item name, the
+    #: currency, the invoice number. Empty when the finding is about the vendor's
+    #: practice as such — arithmetic drift and dating quirks belong to the vendor,
+    #: not to any one value on the page. It exists so precedent can be matched on
+    #: the question rather than on the prose in `detail`, which would be guesswork.
+    subject: str = ""
 
 
 class ValidatorSummary(BaseModel):
@@ -157,6 +168,10 @@ class ValidatorSummary(BaseModel):
         constraint. CRITICAL is downgraded rather than dropped, so the agent's
         concern still reaches the Approver as an advisory warning: it loses its
         authority over the graph, not its voice.
+
+        `subject` is cleared for the same reason the code is: it is the key
+        precedent is looked up and accumulated by, and a model that could mint
+        one could write itself a history.
         """
         return [
             issue.model_copy(
@@ -165,6 +180,7 @@ class ValidatorSummary(BaseModel):
                     "severity": (
                         Severity.WARNING if issue.severity == Severity.CRITICAL else issue.severity
                     ),
+                    "subject": "",
                 }
             )
             for issue in issues
@@ -204,6 +220,113 @@ class ValidationReport(BaseModel):
         site so the two cannot drift apart.
         """
         return any(i.code == IssueCode.DUPLICATE_INVOICE for i in self.issues)
+
+
+# ---------------------------------------------------------------------------
+# Precedent — what human reviewers have already settled
+# ---------------------------------------------------------------------------
+
+
+class PrecedentCase(BaseModel):
+    """One prior invoice where a person answered this same question.
+
+    Only ever built from a run a *human* resolved. An automatic decision is not
+    evidence about anything: letting one in would have the system's own output
+    vote for its next output, and a single approval would compound into
+    unlimited authority.
+    """
+
+    run_id: str
+    invoice_number: str
+    total: float | None = None
+    currency: str = "USD"
+    #: The quantity this finding's code puts at risk on *that* invoice — the
+    #: discrepancy for an arithmetic finding, the total for a currency one.
+    #: Comparability is measured on it, never on the invoice total by default.
+    at_risk: float = 0.0
+    reviewed_at: str = ""
+    action: str = ""  # override_approve | confirm
+    note: str = ""
+    #: This case's contribution to `Precedent.support`, after the comparability
+    #: and recency multipliers.
+    weight: float = 0.0
+
+
+class Precedent(BaseModel):
+    """History's answer to one open question on the invoice being decided.
+
+    The question is `(code, subject, vendor)` — an exact key, deliberately:
+    two invoices are similar here when they raise the same finding about the
+    same thing for the same vendor, which is a stricter and more auditable test
+    than any resemblance between the documents themselves.
+    """
+
+    code: IssueCode
+    subject: str
+    vendor: str
+    #: The current invoice's finding, verbatim, so a citation can be read
+    #: without joining back to the validation report.
+    detail: str = ""
+    at_risk: float = 0.0
+    burden: float = 0.0
+    support: float = 0.0
+    cases: list[PrecedentCase] = Field(default_factory=list)
+    #: Prior invoices on this key a person *rejected*. Any at all zeroes the
+    #: support: mixed history is not evidence, it is a disagreement.
+    rejections: int = 0
+    #: Why release is barred outright, whatever the arithmetic says. Empty when
+    #: nothing bars it. Kept as prose because it is shown to a reviewer.
+    blocked_by: str = ""
+    #: Set by `rules.precedent_releases` when the bundle is built — the policy
+    #: call, made once so the rule engine, the citation row and the dashboard
+    #: cannot each reach a different conclusion from the same numbers.
+    released: bool = False
+    #: The burden/support breakdown, term by term. Persisted rather than only
+    #: the two totals: it is what makes `precedent_citations` a training log
+    #: and not merely an audit trail.
+    terms: dict[str, float] = Field(default_factory=dict)
+
+    @property
+    def cited_run_ids(self) -> list[str]:
+        return [c.run_id for c in self.cases]
+
+    def summary_line(self) -> str:
+        """One line a person or a model can read the whole verdict from."""
+        who = f"{self.code}" + (f" '{self.subject}'" if self.subject else "")
+        if self.blocked_by:
+            return f"{who} @ {self.vendor}: precedent does not apply — {self.blocked_by}"
+        if not self.cases:
+            return f"{who} @ {self.vendor}: no comparable prior decision exists"
+        cases = f"{len(self.cases)} prior invoice(s) approved by a person"
+        if self.rejections:
+            cases += f", but {self.rejections} rejected by a person"
+        verdict = "settled" if self.released else "not settled"
+        return (
+            f"{who} @ {self.vendor}: {cases} "
+            f"(support {self.support:.2f} vs burden {self.burden:.2f} — {verdict})"
+        )
+
+
+class PrecedentBundle(BaseModel):
+    """Everything history has to say about one invoice's open questions."""
+
+    findings: list[Precedent] = Field(default_factory=list)
+
+    def for_issue(self, code: IssueCode, subject: str) -> Precedent | None:
+        for p in self.findings:
+            if p.code == code and p.subject == subject:
+                return p
+        return None
+
+    @property
+    def has_cases(self) -> bool:
+        """Whether history has anything at all to say.
+
+        This is the gate on offering the Approver its tool: binding a schema and
+        paying a round-trip so a model can be told "no prior cases" is cost for
+        nothing, and the same sentence fits in one line of a block it already reads.
+        """
+        return any(p.cases for p in self.findings)
 
 
 # ---------------------------------------------------------------------------

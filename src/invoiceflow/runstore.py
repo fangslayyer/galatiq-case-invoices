@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -42,6 +43,7 @@ from .models import (
     OverrideRecord,
     PaymentResult,
     PaymentStatus,
+    PrecedentBundle,
     RuleReasonKind,
     Severity,
     TraceEvent,
@@ -87,6 +89,105 @@ _OVERRIDE_SOURCE = {
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+#: Columns that arrived after the tables holding them. SQLite can add a column
+#: but cannot alter one, so every entry must be additive and carry a default —
+#: which is the only kind of change this schema has ever made, and the only kind
+#: that has any business happening without a real migration tool.
+_ADDED_COLUMNS: list[tuple[str, str, str]] = [
+    ("validation_issues", "subject", "TEXT NOT NULL DEFAULT ''"),
+]
+
+#: Tables whose *declaration* may be recreated in place when it stops matching
+#: schema.sql. SQLite can add a column but cannot touch a CHECK, so widening one
+#: — `rule_reasons.kind` gaining 'precedent' — means rebuilding the table and
+#: copying the rows across.
+#:
+#: An explicit allowlist rather than "rebuild whatever differs", because a
+#: rebuild is only safe when the change *widens* what is allowed. Narrowing one
+#: would silently drop every row that no longer fits, and deciding which is
+#: which is a judgement, not something to infer from a diff.
+_REBUILDABLE = {"rule_reasons"}
+
+
+def _canonical(sql: str) -> str:
+    """A CREATE statement reduced to what it actually declares — comments and
+    whitespace removed — so a stored one can be compared with a fresh one."""
+    return re.sub(r"\s+", " ", re.sub(r"--[^\n]*", "", sql)).strip()
+
+
+def _rebuild_table(conn: sqlite3.Connection, name: str, statement: str) -> None:
+    """Recreate `name` from `statement`, carrying every column both versions
+    share. SQLite's own recommended dance for a constraint change."""
+    conn.execute(
+        re.sub(rf"\bCREATE TABLE {name}\b", f"CREATE TABLE {name}__new", statement, count=1)
+    )
+    old = [row[1] for row in conn.execute(f"PRAGMA table_info({name})")]
+    new = {row[1] for row in conn.execute(f"PRAGMA table_info({name}__new)")}
+    shared = ", ".join(column for column in old if column in new)
+    conn.execute(f"INSERT INTO {name}__new ({shared}) SELECT {shared} FROM {name}")
+    conn.execute(f"DROP TABLE {name}")
+    conn.execute(f"ALTER TABLE {name}__new RENAME TO {name}")
+
+
+def _statements(script: str):
+    """Split a SQL script into complete statements.
+
+    `sqlite3.complete_statement` rather than a split on ';': it knows about
+    string literals and comments, and schema.sql is full of both.
+    """
+    buffer = ""
+    for line in script.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            yield buffer
+            buffer = ""
+
+
+def _created_object(statement: str) -> str | None:
+    """The name a CREATE statement declares, or None for anything else.
+
+    Comments are stripped first, so a table discussed in a comment above some
+    other statement is never mistaken for one being created.
+    """
+    body = re.sub(r"--[^\n]*", "", statement)
+    match = re.search(r"CREATE\s+(?:TABLE|VIEW|INDEX)\s+(\w+)", body, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def _grow_schema(conn: sqlite3.Connection, existing: set[str]) -> None:
+    """Bring a database created by an older revision up to schema.sql.
+
+    Additive only, and deliberately not a migration framework: every object the
+    schema declares and this database lacks is created, every column in
+    `_ADDED_COLUMNS` that is missing is added with its default, and nothing is
+    ever dropped, renamed or retyped.
+
+    The reasoning is the issue_codes re-seed's, one level up: a schema change has
+    to reach the databases that already exist, or the first run to need it dies
+    on a real invoice rather than on the commit that caused it. The alternative
+    was making somebody's audit trail the price of an upgrade, which is a strange
+    thing for an audit trail to cost.
+    """
+    # Columns before objects, not the other way round: a new view can select a
+    # new column, and creating it against a table that has not grown one yet
+    # leaves a view that parses now and fails the first time it is queried.
+    for table, column, declaration in _ADDED_COLUMNS:
+        if table not in existing:
+            continue
+        held = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in held:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+    declared = {r["name"]: r["sql"] for r in conn.execute("SELECT name, sql FROM sqlite_master")}
+    for statement in _statements(SCHEMA_PATH.read_text()):
+        name = _created_object(statement)
+        if name is None:
+            continue
+        if name not in existing:
+            conn.execute(statement)
+        elif name in _REBUILDABLE and _canonical(declared[name]) != _canonical(statement):
+            _rebuild_table(conn, name, statement)
 
 
 @dataclass(frozen=True)
@@ -147,12 +248,12 @@ class RunStore:
     def _ensure_schema(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
-            exists = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs'"
-            ).fetchone()
-            if not exists:
+            existing = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master")}
+            if "runs" not in existing:
                 conn.execute("PRAGMA journal_mode = WAL")  # persistent, set once
                 conn.executescript(SCHEMA_PATH.read_text())
+            else:
+                _grow_schema(conn, existing)
             # Re-seeded on every init, not only at creation. issue_codes is a
             # lookup table that validation_issues.code holds a live foreign key
             # to, so a code added to the IssueCode enum has to reach databases
@@ -419,6 +520,7 @@ class RunStore:
         overrides: list[OverrideRecord],
         payment: PaymentResult | None,
         trace: list[TraceEvent],
+        precedents: PrecedentBundle | None = None,
     ) -> None:
         """Write every artifact of one finished run in a single transaction."""
         decision_source = None
@@ -556,7 +658,7 @@ class RunStore:
                 )
                 conn.executemany(
                     "INSERT INTO validation_issues (report_id, seq, code, severity, detail, "
-                    "origin, tool_name) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "subject, origin, tool_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         (
                             report_pk,
@@ -564,6 +666,7 @@ class RunStore:
                             issue.code.value,
                             issue.severity.value,
                             issue.detail,
+                            issue.subject,
                             "agent" if issue.code == IssueCode.AGENT_OBSERVATION else "tool",
                             None,
                         )
@@ -591,12 +694,41 @@ class RunStore:
                         (RuleReasonKind.REVIEW, constraints.review_reasons),
                         (RuleReasonKind.SCRUTINY, constraints.scrutiny_reasons),
                         (RuleReasonKind.ADVISORY, constraints.advisory_warnings),
+                        (RuleReasonKind.PRECEDENT, constraints.precedent_discharged),
                     )
                     for reason in bucket
                 ]
                 conn.executemany(
                     "INSERT INTO rule_reasons (rule_evaluation_id, kind, reason) VALUES (?, ?, ?)",
                     reasons,
+                )
+
+            # Written whether or not anything was released: a refusal to release
+            # is as much a fact about the policy as a release is, and "how often
+            # does history fall short, and by how much?" is the question that
+            # says whether this feature is worth its complexity.
+            if precedents is not None:
+                conn.executemany(
+                    "INSERT INTO precedent_citations (run_id, code, subject, vendor, cases, "
+                    "rejections, burden, support, released, blocked_by, cited_run_ids, terms) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            run_pk,
+                            p.code.value,
+                            p.subject,
+                            p.vendor,
+                            len(p.cases),
+                            p.rejections,
+                            p.burden,
+                            p.support,
+                            int(p.released),
+                            p.blocked_by,
+                            json.dumps(p.cited_run_ids),
+                            json.dumps(p.terms),
+                        )
+                        for p in precedents.findings
+                    ],
                 )
 
             for round_no, round_ in enumerate(critique_rounds, 1):
@@ -821,6 +953,75 @@ class RunStore:
                 ),
             )
 
+    # -- precedent ----------------------------------------------------------
+
+    def precedent_rows(self, code: str, subject: str) -> list[dict]:
+        """Every prior decision a *person* made on one open question.
+
+        Deliberately not filtered by vendor here. The vendor comparison needs
+        normalising (case, punctuation, spacing) and doing it in SQL would mean
+        two implementations of one rule that must never disagree — so the rows
+        come back by `(code, subject)`, which the index covers, and
+        `precedent.vendor_key` does the matching in the one place it is defined.
+
+        `v_review_precedent` is what makes this only ever human decisions: an
+        automatically approved run has no `human_reviews` row to join to, and so
+        cannot become evidence for the next automatic approval.
+        """
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM v_review_precedent WHERE code = ? AND subject = ? "
+                "ORDER BY reviewed_at",
+                (code, subject),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def paid_vendors(self) -> list[str]:
+        """Every vendor the company has actually settled with, verbatim.
+
+        Read from the registry rather than from `runs.final_status`, because the
+        registry is where a human override lands too — "have we ever paid these
+        people?" must count the invoices a person released, not only the ones
+        the pipeline released by itself. Returned unnormalised: `vendor_key` is
+        the one place that decides when two spellings are one company.
+        """
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT vendor FROM invoice_registry "
+                "WHERE final_status = ? AND vendor <> ''",
+                (FinalStatus.PAID.value,),
+            ).fetchall()
+        return [r["vendor"] for r in rows]
+
+    def invoice_for_run(self, run_id: str) -> Invoice | None:
+        """The invoice one run extracted.
+
+        Precedent needs the whole invoice, not the summary row: what a prior
+        finding put at risk is recomputed from it with the very same function
+        that priced the current one, so a case can never be weighed on a
+        different measure than the invoice it is being weighed against.
+        """
+        with self.connect() as conn:
+            row = conn.execute("SELECT id FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                return None
+            return self._load_invoice(conn, row["id"])
+
+    def learned_precedent(self) -> list[dict]:
+        """What the pipeline has learned, per open question — the Learning tab."""
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute("SELECT * FROM v_precedent_learning")]
+
+    def citations_for(self, run_id: str) -> list[dict]:
+        """The precedent this run was decided against, released or not."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT pc.* FROM precedent_citations pc "
+                "JOIN runs r ON r.id = pc.run_id WHERE r.run_id = ? ORDER BY pc.id",
+                (run_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def review_queue(self) -> list[InvoiceRunResult]:
         """Runs waiting on a human decision.
 
@@ -1025,7 +1226,9 @@ class RunStore:
                 )
             return None
         issues = [
-            ValidationIssue(code=i["code"], severity=i["severity"], detail=i["detail"])
+            ValidationIssue(
+                code=i["code"], severity=i["severity"], detail=i["detail"], subject=i["subject"]
+            )
             for i in conn.execute(
                 "SELECT * FROM validation_issues WHERE report_id = ? ORDER BY seq", (row["id"],)
             ).fetchall()

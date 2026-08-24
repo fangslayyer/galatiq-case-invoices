@@ -12,6 +12,7 @@ from typing import cast
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import BaseTool
 from pydantic import BaseModel
 
 from .models import ApprovalDecision, Critique, Invoice, ValidationReport, ValidatorSummary
@@ -31,6 +32,39 @@ class ExtractionError(RuntimeError):
     def __init__(self, message: str, attempts: list[str] | None = None):
         super().__init__(message)
         self.attempts = attempts or []
+
+
+def _tool_loop(
+    llm: BaseChatModel,
+    tools: list[BaseTool],
+    messages: list[BaseMessage],
+    max_rounds: int,
+) -> list[str]:
+    """Let the model call `tools` until it stops, extending `messages` in place.
+
+    Hand-rolled rather than delegated to an agent executor so that every step is
+    visible and testable — and shared by the two agents that use tools so the
+    Approver's loop cannot quietly diverge from the Validator's.
+
+    Returns the tool names actually called, in order. The Validator does not need
+    that (each check records itself), but the Approver does: whether it chose to
+    consult precedent is exactly the measure of whether offering the tool was
+    worth the round-trip.
+    """
+    tools_by_name = {t.name: t for t in tools}
+    llm_with_tools = llm.bind_tools(tools)
+    called: list[str] = []
+    for _ in range(max_rounds):
+        response = llm_with_tools.invoke(messages)
+        messages.append(response)
+        if not isinstance(response, AIMessage) or not response.tool_calls:
+            break
+        for call in response.tool_calls:
+            tool = tools_by_name.get(call["name"])
+            output = tool.invoke(call["args"]) if tool else f"unknown tool {call['name']}"
+            called.append(call["name"])
+            messages.append(ToolMessage(content=str(output), tool_call_id=call["id"]))
+    return called
 
 
 def _ask[SchemaT: BaseModel](
@@ -130,24 +164,15 @@ MAX_TOOL_ROUNDS = 4
 
 
 def run_validator(llm: BaseChatModel, ctx: ValidationContext) -> ValidationReport:
-    tools = build_tools(ctx)
-    tools_by_name = {t.name: t for t in tools}
-    llm_with_tools = llm.bind_tools(tools)
     messages: list[BaseMessage] = [
         SystemMessage(VALIDATOR_SYSTEM),
         HumanMessage(
             "Validate this invoice:\n" + Tag.INVOICE.wrap(ctx.invoice.model_dump_json(indent=2))
         ),
     ]
-    for _ in range(MAX_TOOL_ROUNDS):
-        response = llm_with_tools.invoke(messages)
-        messages.append(response)
-        if not isinstance(response, AIMessage) or not response.tool_calls:
-            break
-        for call in response.tool_calls:
-            tool = tools_by_name.get(call["name"])
-            output = tool.invoke(call["args"]) if tool else f"unknown tool {call['name']}"
-            messages.append(ToolMessage(content=str(output), tool_call_id=call["id"]))
+    # The names come back but are ignored: each check records itself into
+    # ctx.tools_used, which is what `safety_net` below is computed against.
+    _tool_loop(llm, build_tools(ctx), messages, MAX_TOOL_ROUNDS)
 
     # Safety net: business-critical checks always run, even if the agent
     # chose not to call them. Which ones it skipped is recorded — that gap is
@@ -219,6 +244,27 @@ and you must reach it from the evidence:
 Write reasoning a finance stakeholder can act on: name the specific evidence.
 """
 
+#: Appended to APPROVER_SYSTEM only when precedent is on the table, so an invoice
+#: history has nothing to say about is judged on a prompt byte-identical to the
+#: one this pipeline used before precedent existed.
+APPROVER_PRECEDENT = """
+Prior human decisions are evidence — the one kind that can settle a question the
+documents themselves cannot. Your tool find_similar_invoices returns how people
+decided invoices raising these same findings from this same vendor: the amounts,
+the dates, and the reviewers' own notes.
+
+- rule_constraints.precedent_discharged lists findings a run of human decisions
+  has already answered, naming the invoices they were answered on. Those are
+  discharged by evidence, which is exactly the standard above — treat them as
+  settled and do not re-open them. If a citation looks wrong to you, call the
+  tool and read the cases before you act on that doubt.
+- A finding NOT in that list is not settled, however many cases the tool returns.
+  One prior approval is worth knowing when you are choosing between rejecting an
+  invoice and escalating it; it is never on its own a reason to approve one.
+- History is about this vendor's habits. It says nothing about whether the sums
+  on this particular invoice are right, and cannot discharge anything else.
+"""
+
 CRITIC_SYSTEM = """\
 You are the Critic agent — an adversarial reviewer of the Approver's decision.
 You do not decide; you audit the decision against the evidence.
@@ -239,6 +285,24 @@ Every verdict judges the decision, not the invoice: affirming a rejection says
 the rejection was right, not that the invoice is sound.
 """
 
+#: Appended to CRITIC_SYSTEM only when the Approver was given precedent, so the
+#: audit is against the same evidence and never against an empty block.
+CRITIC_PRECEDENT = """
+This decision was made with access to prior human decisions, in the <precedent>
+block below. Audit any use of them:
+- A citation is evidence only if the block actually holds those cases. One that
+  names invoices the block does not show is a story with numbers in it.
+- Findings listed in rule_constraints.precedent_discharged are settled, and an
+  Approver that re-opened one is wrong in the opposite direction — say so.
+- A single prior approval is not a rule. If approval rests on one case and
+  nothing else, that is glossing over the finding, not answering it.
+"""
+
+
+#: One round is enough for a tool that takes no arguments and answers in full;
+#: the second exists only so a model that calls it twice is not truncated.
+MAX_APPROVER_TOOL_ROUNDS = 2
+
 
 def _decision_context(
     invoice: Invoice, report: ValidationReport, constraints: RuleConstraints
@@ -258,14 +322,34 @@ def run_approver(
     report: ValidationReport,
     constraints: RuleConstraints,
     critic_feedback: str | None = None,
-) -> ApprovalDecision:
+    tools: list[BaseTool] | None = None,
+) -> tuple[ApprovalDecision, list[str]]:
+    """Decide one invoice. Returns (decision, tools the agent chose to call).
+
+    `tools` is empty for most invoices — the graph offers precedent only where
+    history could actually answer something — and when it is, this takes exactly
+    the path it took before precedent existed: one structured-output call, no
+    bound schema, no extra round-trip, and the unextended system prompt.
+
+    There is deliberately no safety net here, unlike the Validator's. A skipped
+    check leaves the pipeline blind about the invoice; a skipped precedent lookup
+    leaves it blind about nothing, because the rule engine has already read the
+    same history and acted on it. Forcing the block in would spend tokens on
+    every flagged invoice to tell the model something its constraints already say.
+    """
     human = "Decide on this invoice:\n" + _decision_context(invoice, report, constraints)
     if critic_feedback:
         human += (
             "\n\nThe Critic rejected your previous decision — address this:\n"
             + Tag.FEEDBACK.wrap(critic_feedback)
         )
-    return _ask(llm, ApprovalDecision, [SystemMessage(APPROVER_SYSTEM), HumanMessage(human)])
+    system = APPROVER_SYSTEM + (APPROVER_PRECEDENT if tools else "")
+    messages: list[BaseMessage] = [SystemMessage(system), HumanMessage(human)]
+    consulted = _tool_loop(llm, tools, messages, MAX_APPROVER_TOOL_ROUNDS) if tools else []
+    # The whole transcript, not a fresh conversation: whatever the tool returned
+    # is the evidence the decision has to be made on, and starting over would
+    # throw it away between looking and deciding.
+    return _ask(llm, ApprovalDecision, messages), consulted
 
 
 def run_critic(
@@ -274,11 +358,16 @@ def run_critic(
     report: ValidationReport,
     constraints: RuleConstraints,
     decision: ApprovalDecision,
+    precedent: str = "",
 ) -> Critique:
+    """Audit one decision. `precedent` is the block the Approver was given — the
+    same evidence, so the audit can check a citation rather than take it."""
     human = (
         "Audit this proposed decision:\n"
         + Tag.DECISION.wrap(decision.model_dump_json(indent=2))
         + "\n"
         + _decision_context(invoice, report, constraints)
+        + (f"\n{precedent}" if precedent else "")
     )
-    return _ask(llm, Critique, [SystemMessage(CRITIC_SYSTEM), HumanMessage(human)])
+    system = CRITIC_SYSTEM + (CRITIC_PRECEDENT if precedent else "")
+    return _ask(llm, Critique, [SystemMessage(system), HumanMessage(human)])

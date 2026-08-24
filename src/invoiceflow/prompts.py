@@ -35,6 +35,7 @@ class Tag(StrEnum):
     CONSTRAINTS = "rule_constraints"
     DECISION = "proposed_decision"
     FEEDBACK = "critic_feedback"
+    PRECEDENT = "precedent"
 
     def wrap(self, content: str) -> str:
         """Fence `content` under this tag, defanging any fence label inside it.

@@ -6,7 +6,8 @@ every sample file must have one, and the properties the pipeline relies on
 (cross-format hashing, preserved evidence) must hold.
 """
 
-from tests.conftest import EXTRACTIONS_DIR, INVOICES_DIR
+from invoiceflow.loaders import SUPPORTED_EXTENSIONS
+from tests.conftest import DOCUMENT_DIRS, EXTRACTIONS_DIR
 
 
 def load(name: str):
@@ -16,7 +17,12 @@ def load(name: str):
 
 
 def test_every_sample_file_has_a_recorded_extraction():
-    samples = {p.name for p in INVOICES_DIR.iterdir()}
+    samples = {
+        p.name
+        for d in DOCUMENT_DIRS
+        for p in d.iterdir()
+        if p.suffix.lower() in SUPPORTED_EXTENSIONS
+    }
     recorded = {p.name.removesuffix(".json") for p in EXTRACTIONS_DIR.glob("*.json")}
     assert samples == recorded
 

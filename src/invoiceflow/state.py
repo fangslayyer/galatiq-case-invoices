@@ -12,6 +12,7 @@ from .models import (
     Invoice,
     OverrideRecord,
     PaymentResult,
+    PrecedentBundle,
     TraceEvent,
     ValidationReport,
 )
@@ -56,6 +57,10 @@ class PipelineState(TypedDict, total=False):
     document_run_no: int
     report: ValidationReport
     constraints: RuleConstraints
+    # What history says about this invoice's open questions, resolved once in
+    # `decide` and reused by every later round and by the Critic: a redraft must
+    # be judged against the same evidence as the draft it replaces.
+    precedents: PrecedentBundle
     decision: ApprovalDecision
     # System overrides of agent decisions (hard rules, critic escalation) —
     # appended by the critique node, persisted as decision_overrides.

@@ -122,7 +122,7 @@ committed mermaid source against the topology as compiled today.
 **Why it matters:** same principle as above — no external call on the hot path —
 without giving up the guarantee that the picture matches the code.
 
-### 12. 187 offline tests, plus a separate live suite — shipped
+### 12. 249 offline tests, plus a separate live suite — shipped
 The offline suite runs every sample file through the full graph with extraction
 answered from recorded ground-truth fixtures; the live suite verifies real Grok
 honours that contract. No API key needed to run the tests.
@@ -134,13 +134,20 @@ documented contract.
 ---
 
 ### 13. Relational system of record — shipped ([schema.md](schema.md))
-21 tables and 8 views (`invoiceflow.db`) replacing `results/*.json` as the
+23 tables and 11 views (`invoiceflow.db`) replacing `results/*.json` as the
 system of record; JSON survives as a derived export (`--export-json`). Captures
 three things the JSON silently dropped: the rule constraints that forced an
 outcome, the Extractor's retry feedback, and the agent's original decision when
 anything overrides it. A drift test keeps the design doc and the shipped DDL
 the same database, and `begin_run` writes a pessimistic `failed` row up front,
 so even a crash leaves an honest audit trail.
+
+The schema also *grows* in place. Opening a database created by an older
+revision adds whatever objects and columns it lacks, and rebuilds a table whose
+CHECK has been widened — so a change reaches the databases that already exist
+rather than dying on the first real invoice that needs it. Additive only, and
+never a substitute for a migration tool; the point is simply that nobody's audit
+trail should be the price of an upgrade.
 
 ### 14. Cost and token telemetry per invoice — shipped
 Every LLM round-trip is recorded locally (`llm_calls`: tokens, reasoning
@@ -196,6 +203,102 @@ the row as it goes. Three details worth defending:
 * **The stage reporter is a LangChain callback**, reading LangGraph's own
   `langgraph_node` metadata, so it cannot drift from the topology the way a
   hand-written string inside each node would. Same seam `recording.py` uses.
+
+---
+
+## Learning from human review
+
+### 19. Precedent-weighted approval — shipped
+`human_reviews` was write-only for its whole life. The dashboard filled it in,
+the analytics counted it, and nothing ever read it back — so invoice five asked
+the question invoice one had asked, got the same escalation, and cost a person
+the same five minutes. A queue that never learns is a queue that never shrinks.
+
+The distinction that makes this tractable is *which* questions history can
+answer. Some are about this invoice and always will be. Some are about a
+vendor's habits — whether they really do bill in EUR, whether their totals drift
+by pennies because they round each line rather than the invoice — and a habit is
+exactly the sort of thing a handful of consistent human answers settles. Six
+findings are on the allowlist in [rules.py](../src/invoiceflow/rules.py):
+`unexpected_currency`, the three arithmetic mismatches, and the two due-date
+findings. `PRECEDENT_NEVER` states the argument for each exclusion beside it,
+and a test asserts every code is on one list or the other.
+
+**`unknown_item` is deliberately not releasable.** It is the tempting one — the
+new-SKU case reads exactly like a habit — and it is wrong. Inventory is the
+authoritative record of what the company stocks, so an item absent from it is a
+question about the catalog, and the fix is to add the SKU rather than to teach
+the Approver to stop noticing.
+
+**How much history a finding needs is derived, not configured.** There is no
+"three approvals" setting, because three approvals mean very different things
+either side of a two-cent drift and a four-hundred-dollar one. Two quantities,
+each explainable term by term
+([precedent.py](../src/invoiceflow/precedent.py)):
+
+* **burden** — what has to be proven, scaled by what is actually at risk, which
+  is *not always the invoice total*. For an arithmetic finding the money at risk
+  is the gap, so a two-cent drift is near the floor and a $412 one is at the
+  ceiling. Plus half a point for every other warning still open, and a full point
+  when the company has never paid this vendor anything — a brand-new vendor with
+  a brand-new quirk is the fraud shape, not the supplier shape.
+* **support** — one point per prior invoice where a person answered this same
+  question, times a comparability factor measured on that same at-risk quantity,
+  times a recency factor. Released when `support >= burden`.
+
+It is deliberately not a probability. Nothing here is calibrated against
+outcomes, and printing "87% confident" over an ordinal evidence budget would be
+a claim the system cannot support.
+
+**Precedent releases the block; it never casts the vote.** A discharged finding
+moves out of `advisory_warnings` into `precedent_discharged` carrying the
+invoices it was settled on, which is simultaneously what clears the hard rule and
+what stops the Critic re-litigating it. The Approver still has to reach approval
+as its own affirmative finding, and every ceiling is checked before the
+arithmetic is: a critical finding, a code off the allowlist, a single human
+rejection on the key, a forged prompt fence, or a total above the scrutiny
+threshold ends it regardless of how much support accumulated.
+
+**The load-bearing guard is that automatic approvals never become precedent**,
+and it is expressed as the shape of `v_review_precedent` rather than as a filter:
+a run reaches that view only by joining `human_reviews`, so one the pipeline
+decided by itself has nothing to join to. Without it, one approval votes for the
+next decision and that one for the next, and the system ends up citing itself as
+the reason it paid.
+
+**The tool is gated on relevance, not on the model's mood.** The Approver's
+`find_similar_invoices` — its first tool, over the same loop the Validator uses —
+is bound only when the invoice raises a releasable finding *and* history has
+cases for it. Everything else takes the path it took before this existed: one
+structured-output call, no bound schema, no extra round-trip, and an unextended
+system prompt. Asking a model to report that it is unsure would cost the
+round-trip the gate was meant to save, since it cannot know until it has looked.
+There is no safety net forcing the block in, unlike the Validator's, because a
+skipped lookup leaves the pipeline blind about nothing — the rule engine has
+already read the same history. Whether the Approver chose to open the file is
+recorded either way.
+
+**Day 2.** The weights are hand-set, and hand-set numbers are a placeholder for a
+model. The right time to fit one is when there is data, and there is not: the
+labels are human review decisions, which is precisely the scarce quantity —
+single digits per `(code, subject, vendor)` key for years. And cosine similarity
+over invoice text is likely the wrong target anyway, since it conflates documents
+that *look* alike with invoices that ask the *same question*; the exact key is
+deliberately sharp about the thing worth being sharp about. What would pay is a
+supervised model over decision features — amount ratio, days elapsed, vendor
+tenure, co-occurring findings, note text — predicting what the human did, which
+turns `support >= burden` into a calibrated probability and lets the release bar
+be stated in money. `precedent_citations.terms` stores the breakdown rather than
+the two totals precisely so that dataset accumulates from today. Two traps come
+with it: **censored labels** (once release is live, labels arrive only for what
+was escalated, so the training set skews toward the model's own errors — the fix
+is routing a random slice of would-be-auto-approvals to a person anyway, which
+costs real reviewer time and is a business decision), and **self-confirmation**,
+which is the guard above and has to survive any rewrite of the scoring.
+
+The whole thing is demonstrable in the dashboard's **🎓 Learning** tab, over two
+vendor histories with deliberately different shapes:
+[data/demo/precedent/README.md](../data/demo/precedent/README.md).
 
 ---
 

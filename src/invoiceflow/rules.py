@@ -11,7 +11,15 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from .models import Invoice, IssueCode, Severity, ValidationReport
+from .models import (
+    Invoice,
+    IssueCode,
+    Precedent,
+    PrecedentBundle,
+    Severity,
+    ValidationIssue,
+    ValidationReport,
+)
 
 #: Findings that always end with a person reading the document, whatever their
 #: severity: the ones where the pipeline has established that it *cannot*
@@ -53,6 +61,119 @@ REVIEW_CODES: dict[IssueCode, str] = {
 }
 
 
+#: Findings precedent may settle, and what a run of human approvals actually
+#: establishes about each. Everything not named here is non-releasable by
+#: default: an allowlist, so a newly added IssueCode is permanently a human's
+#: until someone argues it onto this table.
+#:
+#: The common thread is that the open question is about the *vendor* rather than
+#: about this invoice — a habit, not a fact on the page. Habits are exactly what
+#: a handful of consistent human answers settles; a per-invoice arithmetic
+#: question is not, however many times a similar one came out the same way.
+PRECEDENT_RELEASABLE: dict[IssueCode, str] = {
+    IssueCode.UNEXPECTED_CURRENCY: (
+        "that this vendor genuinely bills in this currency and the company settles it at "
+        "their stated total — a standing fact about the relationship, and the same fact "
+        "every time they invoice"
+    ),
+    IssueCode.TOTAL_MISMATCH: (
+        "that this vendor's grand total drifts from the sum of its parts by a rounding "
+        "artifact rather than an overcharge"
+    ),
+    IssueCode.SUBTOTAL_MISMATCH: (
+        "that this vendor's subtotal drifts from its line values by a rounding artifact"
+    ),
+    IssueCode.LINE_TOTAL_MISMATCH: (
+        "that this vendor rounds each line rather than the invoice, so stated line totals "
+        "sit pennies off quantity x unit price"
+    ),
+    IssueCode.SUSPICIOUS_DUE_DATE: (
+        "that this vendor stamps the due date as the issue date, with the real terms "
+        "carried on the purchase order instead"
+    ),
+    IssueCode.MISSING_DUE_DATE: (
+        "that this vendor never states a due date, because contract terms govern"
+    ),
+}
+
+#: The other side of the same argument, kept explicit because "why can precedent
+#: not settle this one?" is the first question anyone asks of the table above.
+#: Nothing reads this dict — it is documentation with a lint that keeps it
+#: honest (test_precedent asserts the two are disjoint and jointly exhaustive
+#: over the codes that reach an approval decision).
+PRECEDENT_NEVER: dict[IssueCode, str] = {
+    IssueCode.UNKNOWN_ITEM: (
+        "inventory is the authoritative record of what the company stocks, so an item "
+        "absent from it is a question about the catalog, not about the vendor's habits. "
+        "The fix is to add the SKU, not to teach the Approver to stop noticing it"
+    ),
+    IssueCode.MISSING_TOTAL: (
+        "precedent cannot supply a number that is not on the document; there is nothing "
+        "to approve, however many similar invoices were approved"
+    ),
+    IssueCode.REVISION_OF_PAID_INVOICE: (
+        "money has already moved on this invoice number, and every reconciliation is its "
+        "own arithmetic — that a person released a balance once says nothing about the "
+        "next delta"
+    ),
+    IssueCode.REVISED_INVOICE: (
+        "the revision is re-validated on its own merits anyway, so there is no standing "
+        "question for history to answer"
+    ),
+    IssueCode.PROMPT_INJECTION_ATTEMPT: (
+        "precedent must not be reachable by a document that forges this pipeline's prompt "
+        "structure — and see the harder bar in precedent.py, which refuses to release "
+        "*any* finding on a run carrying this one"
+    ),
+    IssueCode.AGENT_OBSERVATION: (
+        "agent-authored, so it carries no subject and no authority; letting it accumulate "
+        "would let a model write itself a history"
+    ),
+}
+
+
+def precedent_releases(precedent: Precedent) -> bool:
+    """Whether history has settled this finding. The policy call, made once.
+
+    Scoring lives in `precedent.py`; the decision lives here, beside the
+    allowlist it is decided against, so the rule engine, the citation row and
+    the dashboard cannot reach three different conclusions from one set of
+    numbers.
+
+    Note what is checked *before* the arithmetic. A code off the allowlist, a
+    bar (`blocked_by`), or a single human rejection ends it regardless of how
+    much support accumulated — support outweighing burden is the last question
+    asked, never the only one.
+    """
+    if precedent.code not in PRECEDENT_RELEASABLE:
+        return False
+    if precedent.blocked_by:
+        return False
+    if precedent.rejections:
+        # Mixed history is not evidence, it is a disagreement — and the one it
+        # would be resolved in favour of is the irreversible direction.
+        return False
+    if not precedent.cases:
+        return False
+    return precedent.support >= precedent.burden
+
+
+def _discharged_reason(issue: ValidationIssue, precedents: PrecedentBundle | None) -> str | None:
+    """The citation that settles this finding, or None if nothing does."""
+    if precedents is None:
+        return None
+    found = precedents.for_issue(issue.code, issue.subject)
+    if found is None or not found.released:
+        return None
+    cited = ", ".join(c.invoice_number for c in found.cases)
+    return (
+        f"{issue.code}: {issue.detail} — settled by precedent: {len(found.cases)} comparable "
+        f"invoice(s) from {found.vendor} were approved by a person ({cited}). Support "
+        f"{found.support:.2f} against a burden of {found.burden:.2f}. This establishes "
+        f"{PRECEDENT_RELEASABLE[issue.code]}"
+    )
+
+
 class RuleConstraints(BaseModel):
     must_reject: bool = False
     reject_reasons: list[str] = Field(default_factory=list)
@@ -61,6 +182,13 @@ class RuleConstraints(BaseModel):
     requires_scrutiny: bool = False
     scrutiny_reasons: list[str] = Field(default_factory=list)
     advisory_warnings: list[str] = Field(default_factory=list)
+    #: Findings a run of human decisions has already answered, each carrying the
+    #: invoices it was answered on. Deliberately NOT in `advisory_warnings`: the
+    #: Approver's own prompt says a warning is discharged by evidence rather than
+    #: by a story, so a finding that has been answered must stop appearing among
+    #: the open ones — otherwise the Critic re-litigates it and bounces a run the
+    #: rules have already released back into the queue it was released from.
+    precedent_discharged: list[str] = Field(default_factory=list)
 
     @property
     def outcome_is_forced(self) -> bool:
@@ -71,10 +199,26 @@ class RuleConstraints(BaseModel):
 
 
 def evaluate_rules(
-    invoice: Invoice, report: ValidationReport, scrutiny_threshold: float
+    invoice: Invoice,
+    report: ValidationReport,
+    scrutiny_threshold: float,
+    precedents: PrecedentBundle | None = None,
 ) -> RuleConstraints:
     c = RuleConstraints()
     for issue in report.issues:
+        # Precedent speaks first, and only where it is allowed to speak: never
+        # to a critical finding, whatever history says. The severity test is
+        # stated here rather than left implied by `PRECEDENT_RELEASABLE` holding
+        # no critical codes — the severity is data, and a check on the money
+        # path should not depend on a table staying curated.
+        discharged = (
+            None if issue.severity == Severity.CRITICAL else _discharged_reason(issue, precedents)
+        )
+        if discharged is not None:
+            # Neither an open warning nor a review reason: answered is answered.
+            c.precedent_discharged.append(discharged)
+            continue
+
         if issue.severity == Severity.CRITICAL:
             c.must_reject = True
             c.reject_reasons.append(f"{issue.code}: {issue.detail}")

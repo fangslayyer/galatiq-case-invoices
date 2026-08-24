@@ -1,0 +1,30 @@
+{
+  "invoice_number": "INV-4001",
+  "vendor": "Northwind Traders",
+  "invoice_date": "2026-03-09",
+  "due_date": "2026-04-08",
+  "due_date_raw": null,
+  "line_items": [
+    {
+      "item": "WidgetA",
+      "quantity": 4,
+      "unit_price": 250.0,
+      "line_total": 1000.0,
+      "note": null
+    },
+    {
+      "item": "WidgetB",
+      "quantity": 2,
+      "unit_price": 500.0,
+      "line_total": 1000.0,
+      "note": null
+    }
+  ],
+  "subtotal": 2000.0,
+  "tax_amount": 170.0,
+  "extra_charges": 0.0,
+  "total": 2170.02,
+  "currency": "USD",
+  "payment_terms": "Net 30",
+  "notes": ""
+}

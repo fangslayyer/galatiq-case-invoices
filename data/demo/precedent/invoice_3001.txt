@@ -1,0 +1,20 @@
+INVOICE
+
+Vendor: Fabrikam GmbH
+Address: Rosenheimer Strasse 14, 81669 Munchen, Germany
+Invoice Number: INV-3001
+Date: 2026-03-02
+Due Date: 2026-04-01
+
+Currency: EUR
+
+Items:
+  WidgetA    qty: 8    unit price: EUR 200.00    amount: EUR 1,600.00
+  WidgetB    qty: 2    unit price: EUR 400.00    amount: EUR 800.00
+
+Subtotal: EUR 2,400.00
+VAT (0%): EUR 0.00
+Total Amount: EUR 2,400.00
+
+Payment Terms: Net 30
+Note: Reverse charge - VAT accounted for by the recipient.

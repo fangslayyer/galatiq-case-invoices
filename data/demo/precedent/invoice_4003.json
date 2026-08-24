@@ -1,0 +1,19 @@
+{
+  "invoice_number": "INV-4003",
+  "vendor": {
+    "name": "Northwind Traders",
+    "address": "1420 Cascade Way, Portland, OR 97209"
+  },
+  "date": "2026-05-18",
+  "due_date": "2026-06-17",
+  "line_items": [
+    {"item": "WidgetA", "quantity": 8, "unit_price": 250.00, "amount": 2000.00},
+    {"item": "WidgetB", "quantity": 4, "unit_price": 500.00, "amount": 2000.00}
+  ],
+  "subtotal": 4000.00,
+  "tax_rate": 0.085,
+  "tax_amount": 340.00,
+  "total": 4752.00,
+  "currency": "USD",
+  "payment_terms": "Net 30"
+}
