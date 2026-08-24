@@ -100,6 +100,21 @@ class InboxItem:
 
 
 @dataclass(frozen=True)
+class SourceDocument:
+    """The document a run read, exactly as it was stored.
+
+    `raw_text` is post-loader: for a PDF that means the pdfplumber extraction,
+    which is what the Extractor actually saw — the version that matters when a
+    figure on screen disagrees with the page.
+    """
+
+    file_format: str
+    raw_text: str
+    char_count: int
+    first_seen_path: str
+
+
+@dataclass(frozen=True)
 class ProcessedRecord:
     """Registry entry: the current standing of one invoice number."""
 
@@ -203,6 +218,16 @@ class RunStore:
                 "SELECT COUNT(*) AS n FROM runs WHERE document_id = ?", (row["id"],)
             ).fetchone()["n"]
         return row["id"], prior
+
+    def document_for_run(self, run_id: str) -> SourceDocument | None:
+        """What this run read, or None when it failed before reading anything."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT d.file_format, d.raw_text, d.char_count, d.first_seen_path "
+                "FROM runs r JOIN documents d ON d.id = r.document_id WHERE r.run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return None if row is None else SourceDocument(**dict(row))
 
     # -- inbox --------------------------------------------------------------
 

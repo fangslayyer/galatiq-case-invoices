@@ -17,7 +17,10 @@ then becomes a run the two queues above can act on.
 Run with:  uv run streamlit run ui/app.py
 """
 
+from pathlib import Path
+
 import streamlit as st
+from streamlit.errors import StreamlitAPIException
 
 from invoiceflow import inbox
 from invoiceflow.config import PROJECT_ROOT, Settings
@@ -181,7 +184,7 @@ def render_verdicts(result: InvoiceRunResult) -> None:
         verdict("Human review", hr.action.replace("_", " "), "blue")
 
 
-def render_run(result: InvoiceRunResult, *, actionable: bool = False) -> None:
+def render_run(result: InvoiceRunResult, *, actionable: bool = False, scope: str = "runs") -> None:
     inv = result.invoice
     running = in_flight(result)
     if running:
@@ -223,6 +226,9 @@ def render_run(result: InvoiceRunResult, *, actionable: bool = False) -> None:
             else:
                 st.markdown("🟢 All checks passed")
         render_verdicts(result)
+
+    with st.expander("Original document"):
+        render_source(result, scope)
 
     with st.expander("Activity log"):
         # Every agent's reasoning in full, in the order it happened. The pane
@@ -281,6 +287,59 @@ def run_fields(result: InvoiceRunResult) -> tuple[str, str, str, str, str]:
     who = (inv.vendor or "unknown vendor") if inv else result.source_file_path.rsplit("/", 1)[-1]
     amount = f"{inv.currency} {inv.total:,.2f}" if inv and inv.total else "—"
     return badge, number, who, amount, result.started_at[:16].replace("T", " ")
+
+
+SOURCE_LANGUAGE = {"json": "json", "xml": "xml", "csv": "csv", "txt": None, "pdf": None}
+SOURCE_MIME = {
+    "json": "application/json",
+    "xml": "application/xml",
+    "csv": "text/csv",
+    "txt": "text/plain",
+    "pdf": "application/pdf",
+}
+
+
+def render_source(result: InvoiceRunResult, scope: str) -> None:
+    """The document as it arrived, and as the Extractor read it.
+
+    Two different things for a PDF, so both are offered: the page itself, and
+    the text pdfplumber pulled out of it. When a total on screen disagrees with
+    the invoice, that gap is usually the answer.
+    """
+    # `scope` disambiguates the download key: one run can be on screen twice —
+    # a rejected invoice appears in its own tab and in All runs — and a widget
+    # key has to be unique across the whole page, not just its section.
+    doc = store.document_for_run(result.run_id)
+    path = Path(result.source_file_path)
+
+    if path.exists():
+        suffix = path.suffix.lstrip(".").lower()
+        st.download_button(
+            f"Download {path.name}",
+            path.read_bytes(),
+            file_name=path.name,
+            mime=SOURCE_MIME.get(suffix, "application/octet-stream"),
+            key=f"download-{scope}-{result.run_id}",
+        )
+        if suffix == "pdf":
+            try:
+                st.pdf(path.read_bytes(), height=600)
+            except StreamlitAPIException:
+                # st.pdf needs the optional streamlit[pdf] extra. Missing it
+                # should cost the preview, not the whole detail pane — the
+                # download and the extracted text below still work.
+                st.caption("Install `streamlit[pdf]` to preview the page inline.")
+    else:
+        st.caption(f"The original file is no longer on disk ({result.source_file_path}).")
+
+    if doc is None:
+        st.caption("Nothing was recorded — this run failed before it could read the file.")
+        return
+    if doc.file_format == "pdf":
+        st.caption(f"Text extracted from the PDF · {doc.char_count:,} characters")
+    else:
+        st.caption(f"{doc.file_format.upper()} · {doc.char_count:,} characters")
+    st.code(doc.raw_text, language=SOURCE_LANGUAGE.get(doc.file_format), height=400)
 
 
 def toggle_run(run_id: str) -> None:
@@ -478,7 +537,11 @@ with tab_inbox:
                     "invoice": r["invoice_number"] or "—",
                     "vendor": r["vendor"] or "—",
                     "total": f"{r['currency']} {r['total']:,.2f}" if r["total"] else "—",
-                    "seconds": round((r["duration_ms"] or 0) / 1000, 1) or "—",
+                    # A string, like every other cell: a float here and "—"
+                    # there makes one column two types, which Arrow refuses to
+                    # serialise the moment a queued row sits beside a finished
+                    # one.
+                    "seconds": f"{r['duration_ms'] / 1000:.1f}" if r["duration_ms"] else "—",
                     "cost": f"${r['cost_usd']:.4f}" if r["cost_usd"] else "—",
                     "note": r["error"] or ("Duplicate submission" if r["prior_runs"] else ""),
                 }
@@ -503,7 +566,7 @@ with tab_queue:
     for result in queue:
         with st.container(border=True):
             st.subheader(run_header(result))
-            render_run(result, actionable=True)
+            render_run(result, actionable=True, scope="queue")
 
 with tab_rejected:
     # Kept out of the escalation queue on purpose: the queue means "this needs a
@@ -515,7 +578,7 @@ with tab_rejected:
         mark = "" if result.human_reviewed_at else " · 🔎 unchecked"
         with st.container(border=True):
             st.subheader(run_header(result) + mark)
-            render_run(result, actionable=True)
+            render_run(result, actionable=True, scope="rejected")
 
 with tab_runs:
     if not results:

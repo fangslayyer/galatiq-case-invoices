@@ -260,7 +260,10 @@ def test_a_row_opens_and_closes_on_a_single_click(dashboard):
     below it agree on the same pass. Reading the button's return value instead
     would leave it saying "View" over an already-open detail."""
     at = AppTest.from_file(APP, default_timeout=60).run()
-    logs = lambda: sum(1 for e in at.expander if e.label == "Activity log")
+
+    def logs() -> int:
+        return sum(1 for e in at.expander if e.label == "Activity log")
+
     before = logs()
 
     row = next(b for b in at.button if b.key and b.key.startswith("toggle-"))
@@ -273,3 +276,102 @@ def test_a_row_opens_and_closes_on_a_single_click(dashboard):
     next(b for b in at.button if b.key == row.key).click().run()
     assert next(b for b in at.button if b.key == row.key).label == "View"
     assert logs() == before
+
+
+class TestTheOriginalDocument:
+    """Every invoice can show what actually arrived, whatever the format."""
+
+    def open_first_row(self, at):
+        next(b for b in at.button if b.key and b.key.startswith("toggle-")).click().run()
+        return at
+
+    def test_a_text_invoice_shows_what_the_extractor_read(self, dashboard):
+        at = self.open_first_row(AppTest.from_file(APP, default_timeout=60).run())
+        assert not at.exception, [e.value for e in at.exception]
+        assert any(e.label == "Original document" for e in at.expander)
+        # The stored text is the file itself for a non-PDF format.
+        source = (INVOICES_DIR / "invoice_1003.txt").read_text().strip()
+        assert any(c.value.strip() == source for c in at.code)
+        assert any(b.label.startswith("Download ") for b in at.download_button)
+
+    def test_a_pdf_offers_the_page_and_the_extracted_text(
+        self, settings, db, fake_brain, monkeypatch
+    ):
+        _export(monkeypatch, settings)
+        pipe = Pipeline(settings, llm=fake_brain)
+        result = pipe.run(INVOICES_DIR / "invoice_1011.pdf")
+        assert result.final_status  # it ran
+
+        at = self.open_first_row(AppTest.from_file(APP, default_timeout=60).run())
+        assert not at.exception, [e.value for e in at.exception]
+        # The page itself — st.pdf ships as a component, so it lands in the
+        # tree as a bidi_component rather than a typed element.
+        assert len(at.get("bidi_component")) == 1
+        # ...and separately what pdfplumber pulled out of it, which is the
+        # version the Extractor actually saw.
+        stored = pipe.store.document_for_run(result.run_id)
+        assert stored is not None and stored.file_format == "pdf"
+        assert any(c.value.strip() == stored.raw_text.strip() for c in at.code)
+
+    def test_a_deleted_upload_says_so_instead_of_breaking(
+        self, settings, db, fake_brain, monkeypatch
+    ):
+        _export(monkeypatch, settings)
+        from invoiceflow import inbox
+
+        path = inbox.save_upload(
+            settings.uploads_dir,
+            "invoice_1001.txt",
+            (INVOICES_DIR / "invoice_1001.txt").read_bytes(),
+        )
+        Pipeline(settings, llm=fake_brain).run(path)
+        path.unlink()  # the spool was cleaned up after processing
+
+        at = self.open_first_row(AppTest.from_file(APP, default_timeout=60).run())
+        assert not at.exception, [e.value for e in at.exception]
+        assert any("no longer on disk" in c.value for c in at.caption)
+        assert not any(b.label.startswith("Download ") for b in at.download_button)
+        # The text survives regardless: it lives in the database, not the file.
+        assert any("Widgets Inc" in c.value for c in at.code)
+
+
+def test_the_inbox_renders_finished_and_queued_rows_together(
+    dashboard, settings, fake_brain, caplog
+):
+    """Every inbox cell has to be one type down the column.
+
+    A queued row has no duration and a finished one does, so a numeric cell
+    with a "—" fallback makes that column part float and part string — which
+    Arrow refuses, taking the whole table down.
+    """
+    from invoiceflow import inbox
+
+    done = inbox.save_upload(
+        settings.uploads_dir, "invoice_1001.txt", (INVOICES_DIR / "invoice_1001.txt").read_bytes()
+    )
+    inbox.enqueue(dashboard, inbox.probe_upload(dashboard, done))
+    inbox.drain(dashboard, lambda: Pipeline(settings, llm=fake_brain))
+
+    waiting = inbox.save_upload(
+        settings.uploads_dir, "invoice_1004.json", (INVOICES_DIR / "invoice_1004.json").read_bytes()
+    )
+    inbox.enqueue(dashboard, inbox.probe_upload(dashboard, waiting))
+
+    # A fake-brain run finishes in milliseconds, which rounds to 0.0 and takes
+    # the same "—" branch as a queued row — so the bug only shows with a
+    # realistic duration behind it.
+    with dashboard.connect() as conn:
+        conn.execute("UPDATE runs SET duration_ms = 12345")
+
+    states = {r["state"] for r in dashboard.inbox_rows()}
+    assert states == {"processed", "queued"}  # the mix that breaks it
+
+    at = AppTest.from_file(APP, default_timeout=60).run()
+    assert not at.exception, [e.value for e in at.exception]
+
+    # Neither at.exception nor the rendered frame can see this: Streamlit
+    # catches the Arrow failure and silently coerces the column, so the only
+    # evidence is the traceback it logs on the way past.
+    assert not [r for r in caplog.records if "Arrow" in r.getMessage()], (
+        "a mixed-type column forced Streamlit to repair the table"
+    )
