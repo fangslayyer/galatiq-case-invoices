@@ -3,8 +3,8 @@
 Browse pipeline runs, inspect each agent's reasoning, and act on the ones a
 person should see. Two queues, kept apart on purpose:
 
-  Escalation queue — the agents could not decide; this needs a decision.
-  Rejected         — the rules already decided; overturn it or confirm it.
+  Needs review — the agents could not decide; this needs a decision.
+  Rejected     — the rules already decided; overturn it or confirm it.
 
 A human action never edits what the agents wrote: it lands as a `human_reviews`
 row (plus a payment and a registry update where money moves), and the effective
@@ -24,7 +24,14 @@ from invoiceflow.config import PROJECT_ROOT, Settings
 from invoiceflow.db import Database
 from invoiceflow.inbox import InboxWorker, UploadProbe
 from invoiceflow.loaders import SUPPORTED_EXTENSIONS
-from invoiceflow.models import FinalStatus, InvoiceRunResult, PaymentStatus, Severity
+from invoiceflow.models import (
+    ApprovalStatus,
+    CritiqueVerdict,
+    FinalStatus,
+    InvoiceRunResult,
+    PaymentStatus,
+    Severity,
+)
 from invoiceflow.review import apply_human_review
 from invoiceflow.runstore import RunStore
 
@@ -46,6 +53,26 @@ INBOX_BADGE = {
 }
 #: Shown instead of the status badge while a run is still in flight.
 IN_FLIGHT_BADGE = "⚙️ processing"
+
+#: Colour per outcome, for the one-line verdicts in the detail pane.
+DECISION_TONE = {
+    ApprovalStatus.APPROVED: "green",
+    ApprovalStatus.REJECTED: "red",
+    ApprovalStatus.NEEDS_REVIEW: "orange",
+}
+#: The Critic judges the Approver's *decision*, never the invoice — affirming a
+#: rejection means the rejection was right, not that the invoice is good. So
+#: these read as verbs on the decision, and an affirm takes the colour of the
+#: decision it upheld rather than a green of its own.
+CRITIQUE_OUTCOME = {
+    CritiqueVerdict.AFFIRM: "upheld the decision",
+    CritiqueVerdict.REVISE: "sent back for revision",
+    CritiqueVerdict.ESCALATE: "escalated to a human",
+}
+VERDICT_TONE = {
+    CritiqueVerdict.REVISE: "orange",
+    CritiqueVerdict.ESCALATE: "orange",  # both push toward a person, like needs review
+}
 
 
 def in_flight(result: InvoiceRunResult) -> bool:
@@ -96,6 +123,64 @@ def resolve(result: InvoiceRunResult, approve: bool, reviewer_note: str) -> bool
     return outcome.recorded
 
 
+def verdict(label: str, outcome: str, tone: str) -> None:
+    """One line: who ruled, and how. Streamlit's :color[] markdown."""
+    st.markdown(f"{label} — :{tone}[**{outcome}**]")
+
+
+def render_verdicts(result: InvoiceRunResult) -> None:
+    """The short version of every ruling on this invoice.
+
+    Deliberately terse: the reasoning behind each of these is in the activity
+    log, and a wall of prose here buries the one thing a reviewer needs, which
+    is who decided what.
+    """
+    if result.validation is not None:
+        issues = result.validation.issues
+        critical = sum(1 for i in issues if i.severity == Severity.CRITICAL)
+        warnings = sum(1 for i in issues if i.severity == Severity.WARNING)
+        if critical:
+            verdict("Validation", f"{critical} critical", "red")
+        elif warnings:
+            verdict("Validation", f"{warnings} warning{'s' if warnings > 1 else ''}", "orange")
+        else:
+            verdict("Validation", "passed", "green")
+
+    if result.decision is not None:
+        status = result.decision.status
+        verdict("Approver", status.replace("_", " "), DECISION_TONE[status])
+
+    for i, round_ in enumerate(result.critique_rounds, 1):
+        label = "Critic" if len(result.critique_rounds) == 1 else f"Critic {i}"
+        outcome = round_.critique.verdict
+        # An affirm inherits the tone of the decision it upheld: "Approver —
+        # rejected (red) / Critic — upheld the decision (green)" would read as
+        # the Critic clearing an invoice it in fact refused.
+        tone = VERDICT_TONE.get(outcome) or DECISION_TONE[round_.decision.status]
+        verdict(label, CRITIQUE_OUTCOME[outcome], tone)
+
+    for override in result.overrides:
+        # The system replacing an agent's call is a ruling in its own right.
+        verdict(
+            "Override",
+            f"{override.kind.replace('_', ' ')} → {override.to_status.replace('_', ' ')}",
+            DECISION_TONE[override.to_status],
+        )
+
+    if result.payment is not None:
+        # `amount` on a declined payment is what was claimed and refused, not
+        # what moved — rendering both alike is how money that never left the
+        # bank reads as a completed payment.
+        pay = result.payment
+        if pay.status == PaymentStatus.SUCCESS:
+            verdict("Payment", f"paid ${pay.amount:,.2f} to {pay.vendor}", "green")
+        else:
+            verdict("Payment", f"declined, ${pay.amount:,.2f} not sent", "red")
+
+    for hr in result.human_reviews:
+        verdict("Human review", hr.action.replace("_", " "), "blue")
+
+
 def render_run(result: InvoiceRunResult, *, actionable: bool = False) -> None:
     inv = result.invoice
     running = in_flight(result)
@@ -137,33 +222,28 @@ def render_run(result: InvoiceRunResult, *, actionable: bool = False) -> None:
                     st.markdown(f"{SEVERITY_ICON[issue.severity]} `{issue.code}` — {issue.detail}")
             else:
                 st.markdown("🟢 All checks passed")
-            st.caption(result.validation.summary)
-        if result.decision is not None:
-            st.markdown("**Decision**")
-            st.markdown(result.decision.reasoning)
-        for i, r in enumerate(result.critique_rounds, 1):
-            st.markdown(f"_Review round {i}:_ **{r.critique.verdict}** — {r.critique.feedback}")
-        if result.payment is not None:
-            # `amount` on a declined payment is what was claimed and refused,
-            # not what moved — rendering both the same way is how $5,940 that
-            # never left the bank read as a completed payment.
-            pay = result.payment
-            if pay.status == PaymentStatus.SUCCESS:
-                st.success(f"💸 Paid **${pay.amount:,.2f}** to {pay.vendor}")
-            else:
-                st.warning(
-                    f"🚫 Declined — **${pay.amount:,.2f}** to {pay.vendor} was not sent "
-                    f"({pay.status.replace('_', ' ')})"
-                )
-        for hr in result.human_reviews:
-            st.info(
-                f"🧑 {hr.action.replace('_', ' ')} by {hr.reviewer} at {hr.reviewed_at}: "
-                f"{hr.from_status} → {hr.to_status}" + (f" — {hr.note}" if hr.note else "")
-            )
+        render_verdicts(result)
 
     with st.expander("Activity log"):
-        for ev in result.trace:
-            st.text(f"[{ev.stage:>10}] {ev.event}  {ev.detail}")
+        # Every agent's reasoning in full, in the order it happened. The pane
+        # above says what was concluded; this says why.
+        if result.validation is not None and result.validation.summary:
+            st.markdown(f"**Validator** — {result.validation.summary}")
+        if result.decision is not None:
+            st.markdown(f"**Approver** — {result.decision.reasoning}")
+        for i, r in enumerate(result.critique_rounds, 1):
+            st.markdown(f"**Critic, round {i}** — {r.critique.verdict}: {r.critique.feedback}")
+        for override in result.overrides:
+            st.markdown(f"**Override** — {override.reasoning}")
+        for hr in result.human_reviews:
+            st.markdown(
+                f"**Human review** — {hr.action.replace('_', ' ')} by {hr.reviewer} at "
+                f"{hr.reviewed_at}" + (f": {hr.note}" if hr.note else "")
+            )
+        if result.trace:
+            st.divider()
+            for ev in result.trace:
+                st.text(f"[{ev.stage:>10}] {ev.event}  {ev.detail}")
 
     if actionable:
         # A rejection is already decided, so the same two buttons mean different
@@ -185,6 +265,58 @@ def render_run(result: InvoiceRunResult, *, actionable: bool = False) -> None:
             result, approve=False, reviewer_note=note
         ):
             st.rerun()
+
+
+#: All-runs list: relative widths for status, invoice, vendor, amount, started, action.
+RUN_COLUMNS = [1.6, 1.2, 3.0, 1.6, 1.6, 0.9]
+#: run_ids whose detail is currently expanded.
+OPEN_RUNS = "runs.open"
+
+
+def run_fields(result: InvoiceRunResult) -> tuple[str, str, str, str, str]:
+    """The five cells of one row in All runs."""
+    inv = result.invoice
+    badge = IN_FLIGHT_BADGE if in_flight(result) else STATUS_BADGE[result.final_status]
+    number = inv.invoice_number if inv else "—"
+    who = (inv.vendor or "unknown vendor") if inv else result.source_file_path.rsplit("/", 1)[-1]
+    amount = f"{inv.currency} {inv.total:,.2f}" if inv and inv.total else "—"
+    return badge, number, who, amount, result.started_at[:16].replace("T", " ")
+
+
+def toggle_run(run_id: str) -> None:
+    """Open or close one row's detail.
+
+    An on_click callback rather than the button's return value: Streamlit runs
+    callbacks *before* the rerun, so the label and the pane below it both see
+    the new state on the same pass. Reading the return value instead would
+    leave the button saying "View" over an already-open detail.
+    """
+    st.session_state.setdefault(OPEN_RUNS, set()).symmetric_difference_update({run_id})
+
+
+@st.fragment
+def run_row(result: InvoiceRunResult) -> None:
+    """One row of All runs, plus its detail when open.
+
+    A fragment so that opening a row reruns only this row. Without it every
+    click re-executes the whole script, which reloads all runs from SQLite and
+    redraws four other tabs to reveal one pane.
+    """
+    is_open = result.run_id in st.session_state.setdefault(OPEN_RUNS, set())
+    row = st.columns(RUN_COLUMNS, vertical_alignment="center")
+    for col, value in zip(row, run_fields(result), strict=False):
+        col.markdown(value)
+    row[-1].button(
+        "Hide" if is_open else "View",
+        key=f"toggle-{result.run_id}",
+        on_click=toggle_run,
+        args=(result.run_id,),
+        type="secondary",  # bordered; tertiary renders as a bare link
+        width="stretch",
+    )
+    if is_open:
+        with st.container(border=True):
+            render_run(result)
 
 
 def run_header(result: InvoiceRunResult) -> str:
@@ -300,6 +432,7 @@ def upload_dialog() -> None:
 if st.session_state.get(UPLOAD_OPEN):
     upload_dialog()
 
+queue = store.review_queue()
 rejected = store.rejected_runs()
 unchecked = sum(1 for r in rejected if not r.human_reviewed_at)
 inbox_counts = store.inbox_counts()
@@ -313,7 +446,7 @@ refresh = 2.0 if pending else None
 tab_inbox, tab_queue, tab_rejected, tab_runs, tab_db = st.tabs(
     [
         f"📥 Inbox ({pending} in flight)" if pending else "📥 Inbox",
-        "🟡 Escalation queue",
+        f"🟡 Needs review ({len(queue)})" if queue else "🟡 Needs review",
         f"⛔ Rejected ({unchecked} unchecked)" if unchecked else "⛔ Rejected",
         "📚 All runs",
         "🗄 Database",
@@ -363,7 +496,6 @@ with tab_inbox:
     inbox_panel()
 
 with tab_queue:
-    queue = store.review_queue()
     if not queue:
         st.success("Nothing needs review.")
     else:
@@ -409,14 +541,18 @@ with tab_runs:
         " · ".join(f"{cur} {amt:,.2f}" for cur, amt in sorted(sent.items())) if sent else "—",
         help="Successful payments only. A declined payment is not money that moved.",
     )
-    options = {
-        f"{IN_FLIGHT_BADGE if in_flight(r) else STATUS_BADGE[r.final_status]} · "
-        f"{r.invoice.invoice_number if r.invoice else '?'} · {r.run_id}": r
-        for r in results
-    }
-    if options:
-        choice = st.selectbox("Pick a run", list(options))
-        render_run(options[choice])
+    if results:
+        # st.columns rather than one padded label per row: a column layout
+        # aligns in the page's own font, where padding a string only lines up
+        # inside a monospace code span.
+        head = st.columns(RUN_COLUMNS, vertical_alignment="bottom")
+        names = ("Status", "Invoice", "Vendor", "Amount", "Started")
+        for col, name in zip(head, names, strict=False):
+            col.caption(name)
+        st.divider()
+
+    for r in results:
+        run_row(r)
 
 with tab_db:
     st.markdown("**Inventory**")

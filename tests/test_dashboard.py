@@ -110,7 +110,7 @@ class TestUploadAndInbox:
         assert not at.exception, [e.value for e in at.exception]
         labels = [t.label for t in at.tabs]
         assert "📥 Inbox" in labels and "📚 All runs" in labels
-        assert "📤 Upload" in {b.label for b in at.button}
+        assert "📤 Upload Invoices" in {b.label for b in at.button}
 
     def test_uploading_queues_a_file_without_processing_it(self, empty_dashboard, settings):
         at = AppTest.from_file(APP, default_timeout=60).run()
@@ -206,9 +206,11 @@ class TestARunStillInFlight:
 
         at = AppTest.from_file(APP, default_timeout=60).run()
         assert not at.exception, [e.value for e in at.exception]
-        labels = [o for o in at.selectbox[0].options if "in-flight-1" in o]
-        assert labels and labels[0].startswith("⚙️ processing"), labels
-        assert not any("💥 failed" in o for o in labels)
+        cells = [m.value for m in at.markdown]
+        assert "invoice_9999.txt" in cells  # the row is listed...
+        assert "⚙️ processing" in cells  # ...as processing
+        assert "💥 failed" not in cells
+        assert any(b.key == "toggle-in-flight-1" for b in at.button)
 
     def test_a_genuinely_failed_run_still_reads_as_failed(self, dashboard, settings, fake_brain):
         """The other half: once a run lands, a failure must look like one."""
@@ -217,8 +219,9 @@ class TestARunStillInFlight:
         assert result.final_status == FinalStatus.FAILED and result.finished_at
 
         at = AppTest.from_file(APP, default_timeout=60).run()
-        labels = [o for o in at.selectbox[0].options if result.run_id in o]
-        assert labels and labels[0].startswith("💥 failed"), labels
+        cells = [m.value for m in at.markdown]
+        assert "does_not_exist.txt" in cells and "💥 failed" in cells
+        assert any(b.key == f"toggle-{result.run_id}" for b in at.button)
 
     def test_the_in_flight_run_explains_itself_instead_of_showing_an_error(self, dashboard):
         dashboard.begin_run(
@@ -229,9 +232,44 @@ class TestARunStillInFlight:
             "abc123",
         )
         at = AppTest.from_file(APP, default_timeout=60).run()
-        pick = at.selectbox[0]
-        pick.select(next(o for o in pick.options if "in-flight-2" in o)).run()
+        # Rows render collapsed, so the detail is not built until it is opened.
+        assert not any("Still processing" in i.value for i in at.info)
+        next(b for b in at.button if b.key == "toggle-in-flight-2").click().run()
         assert not at.exception, [e.value for e in at.exception]
         assert any("Still processing" in i.value for i in at.info)
         # begin_run's placeholder must not be rendered as a red failure.
         assert not any("run did not complete" in e.value for e in at.error)
+
+
+def test_the_needs_review_tab_counts_what_is_waiting(dashboard, settings, fake_brain):
+    """Empty until something escalates, then it carries a count like the others."""
+    at = AppTest.from_file(APP, default_timeout=60).run()
+    assert "🟡 Needs review" in [t.label for t in at.tabs]  # fixture has none yet
+
+    # An unknown item forces review, however the Approver felt about it.
+    pipe = Pipeline(settings, llm=fake_brain)
+    escalated = pipe.run(INVOICES_DIR / "invoice_1016.json")
+    assert escalated.final_status == FinalStatus.NEEDS_REVIEW
+
+    after = [t.label for t in AppTest.from_file(APP, default_timeout=60).run().tabs]
+    assert "🟡 Needs review (1)" in after
+
+
+def test_a_row_opens_and_closes_on_a_single_click(dashboard):
+    """The toggle is an on_click callback, so the button label and the pane
+    below it agree on the same pass. Reading the button's return value instead
+    would leave it saying "View" over an already-open detail."""
+    at = AppTest.from_file(APP, default_timeout=60).run()
+    logs = lambda: sum(1 for e in at.expander if e.label == "Activity log")
+    before = logs()
+
+    row = next(b for b in at.button if b.key and b.key.startswith("toggle-"))
+    assert row.label == "View"
+    row.click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert next(b for b in at.button if b.key == row.key).label == "Hide"
+    assert logs() == before + 1  # exactly one detail opened
+
+    next(b for b in at.button if b.key == row.key).click().run()
+    assert next(b for b in at.button if b.key == row.key).label == "View"
+    assert logs() == before
