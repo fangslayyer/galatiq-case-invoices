@@ -52,6 +52,7 @@ class TestHumanReview:
         out = apply_human_review(pipe.store, revision, approve=True, note="PO amended")
         assert out.recorded
         assert out.to_status == FinalStatus.PAID
+        assert out.payment is not None
         assert out.payment.amount == 4_050.0  # 5,940 claimed - 1,890 already sent
         registry = pipe.store.get_processed("INV-1004")
         assert registry.final_status == "paid" and registry.total == 5_940.0
@@ -64,6 +65,7 @@ class TestHumanReview:
         again = apply_human_review(pipe.store, revision, approve=True)
         assert not again.recorded  # refused, and nothing is written
         assert "nothing to pay" in again.message
+        assert again.payment is not None
         assert again.payment.status == PaymentStatus.SKIPPED_ALREADY_PAID
         registry = pipe.store.get_processed("INV-1004")
         assert registry.final_status == "paid" and registry.total == 5_940.0

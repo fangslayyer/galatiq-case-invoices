@@ -295,7 +295,7 @@ CREATE TABLE human_reviews (
 -- `terms` holds the burden/support breakdown rather than only the two totals.
 -- That is deliberate and forward-looking: with the outcome in `human_reviews`,
 -- these rows are a labelled training set for the day the hand-set weights are
--- replaced by a fitted model (docs/beyond-the-brief.md §19, "Day 2").
+-- replaced by a fitted model.
 CREATE TABLE precedent_citations (
     id            INTEGER PRIMARY KEY,
     run_id        INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,

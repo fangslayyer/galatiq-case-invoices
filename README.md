@@ -2,12 +2,19 @@
 
 A working prototype that automates Acme Corp's end-to-end invoice workflow —
 **ingestion → validation → approval → payment** — replacing a manual process
-with a 30% error rate and 5-day turnaround. Five LLM agents, orchestrated with
-**LangGraph** (LangChain's multi-agent layer) and reasoning with **xAI Grok**,
-process messy real-world invoices: typos, OCR artifacts, fraud attempts,
-duplicate submissions, and data that simply doesn't add up.
+with a 30% error rate and 5-day turnaround. Five agents — four reasoning with
+**xAI Grok**, one deterministic payer — orchestrated with **LangGraph**
+(LangChain's multi-agent layer) process messy real-world invoices: typos, OCR
+artifacts, fraud attempts, duplicate submissions, and data that simply doesn't
+add up.
 
 *(Original case brief: [docs/CASE.md](docs/CASE.md).)*
+
+## Video Introduction
+
+Please start by watching a brief 9 minute video introduction of the system and features I built.
+
+[![Galatiq — take home assignment explanation](https://i.ytimg.com/vi/fjpK0SM52JE/maxresdefault.jpg)](https://www.youtube.com/watch?v=fjpK0SM52JE)
 
 ## Quickstart
 
@@ -21,6 +28,22 @@ uv run streamlit run ui/app.py                             # dashboard: upload, 
 uv run python main.py --export-graph                       # re-render docs/graph.png
 uv run python main.py --export-json all                    # render runs from the DB to results/
 ```
+
+<details>
+<summary>No <code>uv</code>? The same versions, via pip</summary>
+
+`requirements.txt` is exported from `uv.lock`, so it pins exactly what `uv sync`
+installs. It does not contain the project itself, so install that too and drop
+the `uv run` prefix from every command above:
+
+```bash
+python -m venv .venv && source .venv/bin/activate   # Python 3.12
+pip install -r requirements.txt
+pip install -e . --no-deps
+python main.py --init-db
+```
+
+</details>
 
 The dashboard is self-sufficient: after `--init-db` you can start it on an empty
 database and upload invoices from the browser — 📤 Upload, top right. Files queue
@@ -37,15 +60,14 @@ shows the system declining to apply either lesson where it does not reach —
 [data/demo/precedent/README.md](data/demo/precedent/README.md).
 
 Grok is the pipeline's only brain — there is deliberately no rule-based
-fallback parser. "Offline" in the brief means the *surrounding* systems
-(inventory DB, banking API) are simulated locally, not that the LLM is
-optional. The test suite, however, runs entirely without a key (see Testing).
+fallback parser.
 
 ## The multi-agent system
 
-Five separately-prompted agents share a LangGraph `StateGraph`. Control is
-routed by conditional edges over each agent's **structured output** — agents
-never call each other directly, so every hop is inspectable and testable.
+Five agents, four of them separately prompted, share a LangGraph `StateGraph`.
+Control is routed by conditional edges over each agent's **structured output** —
+agents never call each other directly, so every hop is inspectable and
+testable.
 
 ```mermaid
 graph TD
@@ -54,7 +76,7 @@ graph TD
     C -.->|"self-correction ≤2<br/>(inside the agent)"| C
     C -- unrecoverable --> Q[🟡 Escalation queue]
     C --> D{{"🤖 Validator<br/>ReAct tool loop"}}
-    D <--> T1[(check_inventory<br/>verify_arithmetic<br/>check_integrity<br/>check_duplicate)]
+    D <--> T1[(check_inventory<br/>verify_arithmetic<br/>check_integrity<br/>check_duplicate<br/>check_prompt_safety)]
     D -- exact duplicate --> H
     D --> E{{"🤖 Approver"}}
     R[Rule engine<br/>&gt;$10K scrutiny, per vendor window · hard rejects · forced review] --> E
@@ -74,21 +96,7 @@ graph TD
 That diagram is the conceptual flow, not the graph: the tool cylinders, the rule
 engine and the dashboard are code called *inside* nodes, not nodes themselves.
 
-The **dotted self-loop on the Extractor** marks the one distinction worth
-knowing before you go reading: it is a `for` loop inside
-[`run_extractor`](src/invoiceflow/agents.py) that feeds each failure back into
-the next prompt — *not* a cycle in the graph, so it appears nowhere in graph.py.
-The Approver ↔ Critic revision arrow is the opposite: a real conditional edge
-routing `critique` back to `decide` (the node the Approver runs in). Both are
-called self-correction loops below; only one is a LangGraph edge.
-
-The picture below is the graph LangGraph *actually* compiles. Rendering it goes
-through mermaid.ink, so it is a deliberate manual step (`--export-graph`) rather
-than a side effect of every run — the brief allows no external API but Grok.
-Drift is caught offline instead: `test_graph_diagram` compares the committed
-mermaid source ([docs/graph.mmd](docs/graph.mmd)) against the topology as
-compiled today, and fails if the diagram was not re-exported. Note it has no
-self-edge on `ingest`, and the `decide`/`critique` cycle is right there:
+The picture below is the graph LangGraph *actually* compiles.
 
 <img src="docs/graph.png" alt="Compiled LangGraph topology" width="200">
 
@@ -133,8 +141,7 @@ self-edge on `ingest`, and the `decide`/`critique` cycle is right there:
   eligible; `unknown_item` deliberately is not, because inventory is
   authoritative and the fix for a missing SKU is a catalog entry. Automatic
   approvals never count as precedent, so the system can never cite itself as
-  the reason it paid. See
-  [beyond-the-brief.md §19](docs/beyond-the-brief.md#19-precedent-weighted-approval--shipped).
+  the reason it paid.
 - **The threshold is about money, not about pages.** $10,000 is a rule about a
   payment, so sending it as three invoices must not buy a quieter path than
   sending it as one. Before the threshold is applied, the rule engine asks the
@@ -173,7 +180,7 @@ self-edge on `ingest`, and the `decide`/`critique` cycle is right there:
 ## Testing & quality
 
 ```bash
-uv run pytest                      # 268 offline tests, ~28s, no API key needed
+uv run pytest                      # 278 offline tests, ~35s, no API key needed
 uv run pytest --cov=invoiceflow    # with coverage
 uv run pytest -m live              # against real Grok (needs XAI_API_KEY)
 uv run ruff check && uv run ruff format --check
@@ -220,7 +227,7 @@ LANGSMITH_PROJECT=invoiceflow
 
 Runs are named per invoice and tagged with the model, the CLI prints a banner
 whenever tracing is live, and the test suite forces it off
-(`tests/__init__.py`) so 126 fake-brain runs never land in a real project. The
+(`tests/__init__.py`) so no fake-brain run ever lands in a real project. The
 banner reads the same four environment variables the tracer itself does
 (`config.TRACING_ENV_VARS`), so a traced run can never look untraced.
 
@@ -243,13 +250,12 @@ src/invoiceflow/
   pipeline.py            run wrapper: Grok factory, run IDs, one-transaction persist
   cli.py                 rich terminal UI: per-stage trace, usage lines, batch summary
 ui/app.py                Streamlit dashboard: upload + inbox, runs browser, escalation queue
-tests/                   272 tests (268 offline + 4 live-marked)
+tests/                   282 tests (278 offline + 4 live-marked)
 data/invoices/           provided sample invoices (the acceptance dataset)
 data/demo/precedent/     the learning walkthrough: two vendor histories, ours not theirs
 data/demo/structuring/   one vendor's payment, split across three under-threshold invoices
-data/demo/injection/     nine documents that try to talk the pipeline into paying
+data/demo/injection/     three documents that try to talk the pipeline into paying
 docs/graph.png|.mmd      compiled LangGraph topology (`--export-graph` re-renders)
-docs/beyond-the-brief.md additions beyond CASE.md, and why each one earns its place
 docs/schema.md           the relational data model, with design rationale
 ```
 
@@ -267,9 +273,8 @@ that genuinely need judgment, delivered to them in a queue with the evidence
 already assembled.
 
 Several of the defences above were never asked for by the brief — duplicate
-detection, the prompt-injection quarantine, payment idempotency. What each one is
-and why it earns its place is written up in
-[docs/beyond-the-brief.md](docs/beyond-the-brief.md).
+detection, the prompt-injection quarantine, payment idempotency. Each earns its
+place by closing an error mode the manual process left open.
 
 ### Scope cuts (deliberate)
 
@@ -279,3 +284,8 @@ and why it earns its place is written up in
   the `unknown vendor` fraud signal is the hook where they'd attach.
 - Email ingestion is simulated by the email-style `.txt` fixture; an IMAP
   poller would slot in front of the loader unchanged.
+- User auth and privilege levels - right now any user can approve any invoice
+- Item quantities are integers (no units, like lbs, ft, etc)
+- No distributed database - ie one check for already paid invoice won't double-pay due to payment record being on a yet to be synced db
+- Sequential processing. Parallel processing involves race conditions on database edits 
+- Revised invoices below already paid are just marked for review, no automatic clawback

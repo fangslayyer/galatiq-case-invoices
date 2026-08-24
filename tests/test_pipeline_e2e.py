@@ -96,11 +96,12 @@ class TestRegistryOrdering:
         pipe = Pipeline(settings, llm=RogueApprover(extractions=ground_truth))
         first = pipe.run(INVOICES_DIR / "invoice_1004.json")
         assert first.final_status == FinalStatus.PAID
-        assert first.payment.amount == 1890.0
+        assert first.payment is not None and first.payment.amount == 1890.0
 
         second = pipe.run(INVOICES_DIR / "invoice_1004_revised.json")
         assert second.final_status == FinalStatus.NEEDS_REVIEW
         assert second.payment is None  # forced before the `pay` edge, not at the payer
+        assert second.validation is not None
         assert IssueCode.REVISION_OF_PAID_INVOICE in {i.code for i in second.validation.issues}
         # The reviewer is handed the balance, not just the fact of a revision.
         detail = next(
@@ -112,6 +113,7 @@ class TestRegistryOrdering:
         assert "$4,050.00 more is claimed than was paid" in detail
         # ...and the original settlement is untouched.
         prior = pipe.store.get_processed("INV-1004")
+        assert prior is not None
         assert prior.final_status == "paid" and prior.total == 1890.0
 
     def test_exact_duplicate_never_paid_twice(self, pipeline):

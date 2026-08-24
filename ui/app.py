@@ -142,6 +142,40 @@ DEMO_TRACKS: list[tuple[str, str, list[tuple[str, str]]]] = [
 #: only the modal — the `if st.button(...)` that opened it is never
 #: re-evaluated, and any full rerun would otherwise close it mid-upload.
 UPLOAD_OPEN, PROBES = "inbox.upload_open", "inbox.probes"
+#: How many uploads had finished when the page was last drawn in full. The
+#: Inbox polls inside a fragment, so a run landing mid-batch redraws that table
+#: and nothing else — the two queues, All runs and the counts in the tab labels
+#: all still show the database as it was when the batch was queued. Comparing
+#: against this is how the fragment knows a run has landed and takes the whole
+#: page with it.
+INBOX_LANDED = "inbox.landed"
+
+#: The tabs in order, by a name that never changes. Streamlit identifies a tab
+#: by its *whole* label, and these labels carry live counts: when a count
+#: changes, the label the browser has selected no longer exists and it drops
+#: back to the first tab. Harmless when a rerun was a click the person just
+#: made — but now that every landing run reruns the page, it would yank them
+#: out of whatever they were reading every few seconds during a batch. So the
+#: name is the identity: remembered on each switch, handed back to st.tabs as
+#: `default` on every run, with only the count after it moving.
+TAB_NAMES = (
+    "📥 Inbox",
+    "🟡 Needs review",
+    "⛔ Rejected",
+    "🎓 Learning",
+    "📚 All runs",
+    "🗄 Database",
+)
+TAB_KEY, ACTIVE_TAB = "tabs.main", "tabs.active"
+
+
+def remember_tab() -> None:
+    """Record which tab a person moved to, by name rather than by label."""
+    label = st.session_state.get(TAB_KEY) or ""
+    st.session_state[ACTIVE_TAB] = next(
+        (name for name in TAB_NAMES if label.startswith(name)), TAB_NAMES[0]
+    )
+
 
 settings = Settings()
 db = Database(settings.db_path)
@@ -599,6 +633,9 @@ rejected = store.rejected_runs()
 unchecked = sum(1 for r in rejected if not r.human_reviewed_at)
 inbox_counts = store.inbox_counts()
 pending = inbox_counts.get("queued", 0) + inbox_counts.get("processing", 0)
+# Everything below this line is drawn from the database as it is right now, so
+# this is the mark the Inbox fragment polls against.
+st.session_state[INBOX_LANDED] = inbox_counts.get("processed", 0) + inbox_counts.get("failed", 0)
 # run_every is fixed when the fragment is *declared*, and the browser rebuilds
 # its auto-rerun timers from scratch on every full app run — nothing the server
 # sends later can cancel one. So recomputing it here is how the polling both
@@ -613,15 +650,24 @@ for r in results:
     if r.invoice is not None:
         latest_by_number.setdefault(r.invoice.invoice_number, r)
 
+tab_counts = (
+    f"({pending} in flight)" if pending else "",
+    f"({len(queue)})" if queue else "",
+    f"({unchecked} unchecked)" if unchecked else "",
+    f"({len(learned)})" if learned else "",
+    "",  # All runs
+    "",  # Database
+)
+tab_labels = [f"{name} {count}".rstrip() for name, count in zip(TAB_NAMES, tab_counts, strict=True)]
+active_tab = st.session_state.get(ACTIVE_TAB) or TAB_NAMES[0]
 tab_inbox, tab_queue, tab_rejected, tab_learning, tab_runs, tab_db = st.tabs(
-    [
-        f"📥 Inbox ({pending} in flight)" if pending else "📥 Inbox",
-        f"🟡 Needs review ({len(queue)})" if queue else "🟡 Needs review",
-        f"⛔ Rejected ({unchecked} unchecked)" if unchecked else "⛔ Rejected",
-        f"🎓 Learning ({len(learned)})" if learned else "🎓 Learning",
-        "📚 All runs",
-        "🗄 Database",
-    ]
+    tab_labels,
+    key=TAB_KEY,
+    # Stateful, which costs a rerun per tab click: it is the only way the
+    # server learns which tab is open, and therefore which one to hold when a
+    # background run relabels them all.
+    on_change=remember_tab,
+    default=next((label for label in tab_labels if label.startswith(active_tab)), tab_labels[0]),
 )
 
 with tab_inbox:
@@ -662,10 +708,18 @@ with tab_inbox:
             width="stretch",
             hide_index=True,
         )
-        if refresh and not any(r["state"] in ("queued", "processing") for r in rows):
-            # The queue drained. Only a *full* app run takes the browser's
-            # polling timer down, and the other tabs are stale anyway — they
-            # were rendered before these runs existed.
+        # Counts rather than `rows`, which is capped: this has to compare like
+        # with like against the snapshot the full run took.
+        by_state = store.inbox_counts()
+        landed = by_state.get("processed", 0) + by_state.get("failed", 0)
+        still_arriving = by_state.get("queued", 0) + by_state.get("processing", 0)
+        if refresh and (landed != st.session_state.get(INBOX_LANDED, landed) or not still_arriving):
+            # A run landed, so the rest of the page is out of date: a finished
+            # invoice belongs in Needs review and All runs *now*, not when its
+            # batch is done. Only a full app run can put it there — everything
+            # outside this fragment was rendered before that run existed.
+            # It is also the only thing that takes the browser's polling timer
+            # down, which is what the drained case is for.
             st.rerun()
 
     inbox_panel()

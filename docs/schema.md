@@ -519,7 +519,7 @@ CREATE TABLE human_reviews (
 -- `terms` holds the burden/support breakdown rather than only the two totals.
 -- That is deliberate and forward-looking: with the outcome in `human_reviews`,
 -- these rows are a labelled training set for the day the hand-set weights are
--- replaced by a fitted model (docs/beyond-the-brief.md §19, "Day 2").
+-- replaced by a fitted model.
 CREATE TABLE precedent_citations (
     id            INTEGER PRIMARY KEY,
     run_id        INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -560,8 +560,7 @@ Three details are load-bearing:
   its complexity.
 * **`terms` holds the breakdown, not just `burden` and `support`.** The weights
   are hand-set today. With the outcome sitting in `human_reviews`, these rows are
-  a labelled dataset for the day they are fitted instead
-  ([beyond-the-brief.md](beyond-the-brief.md) §19, "Day 2").
+  a labelled dataset for the day they are fitted instead.
 
 ### 4.11 The upload inbox
 

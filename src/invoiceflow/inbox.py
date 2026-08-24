@@ -105,7 +105,7 @@ def probe_upload(store: RunStore, path: Path) -> UploadProbe:
     node makes, so a file that cannot be read is refused here rather than a
     minute later as a `failed` run nobody asked for. The hash it yields is also
     what tells the user these exact bytes have been through the pipeline
-    before — beyond-the-brief §17, applied where it costs nothing.
+    before, applied where it costs nothing.
     """
     size = path.stat().st_size
     fmt = path.suffix.lstrip(".").lower()

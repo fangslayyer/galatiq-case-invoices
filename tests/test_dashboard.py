@@ -130,8 +130,7 @@ class TestUploadAndInbox:
             assert conn.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"] == 0
 
     def test_re_uploading_a_processed_document_says_so_before_queueing(self, dashboard):
-        """beyond-the-brief §17, where it costs nothing: the warning lands
-        before the six Grok calls, not after them."""
+        """The warning lands before the six Grok calls, not after them."""
         at = AppTest.from_file(APP, default_timeout=60).run()
         next(b for b in at.button if b.key == "open-upload").click().run()
         data = (INVOICES_DIR / "invoice_1001.txt").read_bytes()
@@ -335,6 +334,68 @@ class TestTheOriginalDocument:
         assert any("Widgets Inc" in c.value for c in at.code)
 
 
+class TestABatchStillArriving:
+    """The Inbox polls inside a fragment, so a run landing mid-batch redraws
+    that one table. Everything else — both queues, All runs, the counts in the
+    tab labels — is drawn by a *full* run, and until one happens a finished
+    invoice is invisible outside the Inbox. The polling timer is the browser's
+    and out of AppTest's reach; what is testable is the mark the fragment polls
+    against, and that the page does publish a run mid-batch when it reruns.
+    """
+
+    #: Two more files behind the one that lands, so the batch is still moving.
+    BATCH = ("invoice_1016.json", "invoice_1002.txt", "invoice_1005.json")
+
+    def queue_batch(self, store, settings) -> None:
+        from invoiceflow import inbox
+
+        for name in self.BATCH:
+            path = inbox.save_upload(settings.uploads_dir, name, (INVOICES_DIR / name).read_bytes())
+            inbox.enqueue(store, inbox.probe_upload(store, path))
+
+    def land_one(self, store, settings, fake_brain) -> None:
+        from invoiceflow import inbox
+
+        assert inbox.process_one(store, lambda: Pipeline(settings, llm=fake_brain)) is not None
+
+    def test_a_landed_run_reaches_the_rest_of_the_page(self, dashboard, settings, fake_brain):
+        self.queue_batch(dashboard, settings)
+        self.land_one(dashboard, settings, fake_brain)  # one of three
+
+        at = AppTest.from_file(APP, default_timeout=60).run()
+        assert not at.exception, [e.value for e in at.exception]
+        labels = [t.label for t in at.tabs]
+        assert "📥 Inbox (2 in flight)" in labels  # the batch is still moving
+        assert "🟡 Needs review (1)" in labels  # ...and the one that landed counts
+        # The mark the fragment compares against, so it can tell that a run has
+        # landed since this page was drawn.
+        assert at.session_state["inbox.landed"] == 1
+
+        waiting = dashboard.review_queue()
+        assert len(waiting) == 1 and waiting[0].invoice is not None
+        number = waiting[0].invoice.invoice_number
+        assert any(number in h.value for h in at.subheader)  # Needs review
+        assert any(number in m.value for m in at.markdown)  # All runs
+
+    def test_a_refresh_mid_batch_keeps_the_tab_the_reader_is_on(
+        self, dashboard, settings, fake_brain
+    ):
+        """Streamlit identifies a tab by its label, and every count in the bar
+        moves when a run lands. Without a default pinned to the tab in front of
+        the reader, each refresh would drop them back on the Inbox."""
+        self.queue_batch(dashboard, settings)
+        at = AppTest.from_file(APP, default_timeout=60).run()
+        at.session_state["tabs.active"] = "🟡 Needs review"
+
+        self.land_one(dashboard, settings, fake_brain)  # relabels every tab
+        at.run()
+        assert not at.exception, [e.value for e in at.exception]
+        labels = [t.label for t in at.tabs]
+        assert "🟡 Needs review (1)" in labels  # the label it was selected by is gone
+        container = at.get("tab_container")[0]
+        assert labels[container.proto.tab_container.default_tab_index] == "🟡 Needs review (1)"
+
+
 class TestAQuarantinedDocument:
     """A forged-fence document is stopped before the Extractor, so the run has
     no invoice at all. Every pane that names a run by its invoice has to cope."""
@@ -471,7 +532,7 @@ def test_walkthrough_will_not_run_ahead_of_the_person(settings, db, fake_brain, 
 
     at = AppTest.from_file(APP, default_timeout=60).run()
     assert not at.exception, [e.value for e in at.exception]
-    assert not any(b.key.startswith("demo-INV-40") for b in at.button)
+    assert not any(b.key and b.key.startswith("demo-INV-40") for b in at.button)
     assert any("INV-4001 is waiting on you" in i.value for i in at.info)
 
 

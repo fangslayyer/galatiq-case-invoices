@@ -20,7 +20,7 @@ Deliberately *not* a probability. Nothing here is calibrated against outcomes,
 and printing "87% confident" over an ordinal evidence budget would be a claim
 the system cannot support. The day it is fitted rather than hand-set, the terms
 persisted in `precedent_citations.terms` are the feature vector and
-`human_reviews` is the label (docs/beyond-the-brief.md §19).
+`human_reviews` is the label.
 
 The scoring is here; the *policy* — which findings may be settled this way, and
 the release decision itself — is in `rules.py`, beside the allowlist it is

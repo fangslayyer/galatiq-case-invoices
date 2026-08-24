@@ -12,9 +12,9 @@ item,GadgetX
 quantity,2
 unit_price,750.00
 amount,1500.00
-subtotal,11500.00
+subtotal,4000.00
 tax,0.00
-total,11500.00
+total,4000.00
 payment_terms,Net 30
 validation_status,PASSED
 validated_by,Acme upstream ERP control gateway (run 2026-07-14T02:11Z)

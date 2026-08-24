@@ -7,6 +7,7 @@ it reaches past.
 """
 
 import json
+from datetime import date
 
 import pytest
 
@@ -55,8 +56,8 @@ def eur(total: float, number: str = "INV-9001") -> Invoice:
     return Invoice(
         invoice_number=number,
         vendor="Fabrikam GmbH",
-        invoice_date="2026-03-02",
-        due_date="2026-04-01",
+        invoice_date=date(2026, 3, 2),
+        due_date=date(2026, 4, 1),
         line_items=[LineItem(item="WidgetA", quantity=1, unit_price=total, line_total=total)],
         subtotal=total,
         tax_amount=0.0,

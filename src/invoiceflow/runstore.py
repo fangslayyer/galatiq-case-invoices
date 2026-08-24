@@ -413,7 +413,7 @@ class RunStore:
         The read-only half of `register_document`, for the upload dialog's
         pre-flight: it has to say "these exact bytes have been through the
         pipeline N times" *before* the user commits, and six Grok calls are
-        spent (docs/beyond-the-brief.md §17). Registering here instead would
+        spent. Registering here instead would
         file a documents row whose `first_seen_path` names an upload the user
         is about to skip — a lie in the one table whose whole job is identity.
         """

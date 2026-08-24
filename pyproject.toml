@@ -52,7 +52,10 @@ addopts = "-m 'not live'"
 line-length = 100
 target-version = "py312"
 # The case brief is provided material, not our source — never reformat it.
-exclude = ["docs"]
+# extend-, not plain `exclude`: the latter would *replace* ruff's default
+# excludes (.venv, .git, __pycache__), which only .gitignore is covering
+# today — and .gitignore is not consulted outside a git checkout.
+extend-exclude = ["docs"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
