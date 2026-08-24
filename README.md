@@ -57,7 +57,7 @@ graph TD
     D <--> T1[(check_inventory<br/>verify_arithmetic<br/>check_integrity<br/>check_duplicate)]
     D -- exact duplicate --> H
     D --> E{{"🤖 Approver"}}
-    R[Rule engine<br/>&gt;$10K scrutiny · hard rejects · forced review] --> E
+    R[Rule engine<br/>&gt;$10K scrutiny, per vendor window · hard rejects · forced review] --> E
     E --> F{{"🤖 Critic<br/>fraud checklist"}}
     F -- "revise ≤2 rounds<br/>(graph cycle)" --> E
     F -- deadlock --> Q
@@ -135,6 +135,15 @@ self-edge on `ingest`, and the `decide`/`critique` cycle is right there:
   approvals never count as precedent, so the system can never cite itself as
   the reason it paid. See
   [beyond-the-brief.md §19](docs/beyond-the-brief.md#19-precedent-weighted-approval--shipped).
+- **The threshold is about money, not about pages.** $10,000 is a rule about a
+  payment, so sending it as three invoices must not buy a quieter path than
+  sending it as one. Before the threshold is applied, the rule engine asks the
+  registry what else that vendor billed within a fortnight and applies it to the
+  sum: three invoices of $4,860, $4,320 and $5,400 four days apart get exactly
+  the scrutiny one $14,580 invoice would have got. It establishes the pattern and
+  never the intent — three invoices in a week may be three deliveries — so it
+  raises a scrutiny flag with the sibling invoices named, not an accusation. See
+  [data/demo/structuring/README.md](data/demo/structuring/README.md).
 - **Idempotency built in.** A processed-invoice registry fingerprints each
   invoice by canonical content, so the same invoice arriving twice — even as
   TXT once and PDF once — is caught as a duplicate and never double-paid.
@@ -164,7 +173,7 @@ self-edge on `ingest`, and the `decide`/`critique` cycle is right there:
 ## Testing & quality
 
 ```bash
-uv run pytest                      # 249 offline tests, ~25s, no API key needed
+uv run pytest                      # 268 offline tests, ~28s, no API key needed
 uv run pytest --cov=invoiceflow    # with coverage
 uv run pytest -m live              # against real Grok (needs XAI_API_KEY)
 uv run ruff check && uv run ruff format --check
@@ -225,6 +234,7 @@ src/invoiceflow/
   validation.py          deterministic validation tools (the Validator's toolbox)
   rules.py               hard business rules constraining the Approver
   precedent.py           learning from human review: burden, support, the Approver's tool
+  structuring.py         a vendor's other invoices in the same few days (split payments)
   models.py              Pydantic schemas for every agent's structured output
   db.py                  SQLite inventory (the mock legacy system)
   schema.sql             invoiceflow.db DDL — 23 tables + 11 views (docs/schema.md)
@@ -233,9 +243,11 @@ src/invoiceflow/
   pipeline.py            run wrapper: Grok factory, run IDs, one-transaction persist
   cli.py                 rich terminal UI: per-stage trace, usage lines, batch summary
 ui/app.py                Streamlit dashboard: upload + inbox, runs browser, escalation queue
-tests/                   253 tests (249 offline + 4 live-marked)
+tests/                   272 tests (268 offline + 4 live-marked)
 data/invoices/           provided sample invoices (the acceptance dataset)
 data/demo/precedent/     the learning walkthrough: two vendor histories, ours not theirs
+data/demo/structuring/   one vendor's payment, split across three under-threshold invoices
+data/demo/injection/     nine documents that try to talk the pipeline into paying
 docs/graph.png|.mmd      compiled LangGraph topology (`--export-graph` re-renders)
 docs/beyond-the-brief.md additions beyond CASE.md, and why each one earns its place
 docs/schema.md           the relational data model, with design rationale

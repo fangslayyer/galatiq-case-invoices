@@ -33,6 +33,7 @@ from invoiceflow.models import (
     CritiqueVerdict,
     FinalStatus,
     InvoiceRunResult,
+    IssueCode,
     PaymentStatus,
     Severity,
 )
@@ -90,6 +91,20 @@ def in_flight(result: InvoiceRunResult) -> bool:
     pessimistic as it should be.
     """
     return not result.finished_at
+
+
+def quarantined(result: InvoiceRunResult) -> bool:
+    """Whether this run was stopped by the prompt-safety gate at ingestion.
+
+    A quarantined document never reaches the Extractor — that is the point of
+    the gate — so the run has no invoice at all. Every pane that would show
+    invoice fields has to say *why* it cannot, or it reads as a broken run.
+    """
+    return (
+        result.invoice is None
+        and result.validation is not None
+        and any(i.code == IssueCode.PROMPT_INJECTION_ATTEMPT for i in result.validation.issues)
+    )
 
 
 #: The learning walkthrough: two vendor histories, run one invoice at a time.
@@ -250,6 +265,17 @@ def render_run(result: InvoiceRunResult, *, actionable: bool = False, scope: str
         st.info(f"Still processing — started {result.started_at}. Progress is in the Inbox.")
     left, right = st.columns([3, 2])
     with left:
+        if inv is None and quarantined(result):
+            # The gate fires before the Extractor, so there is no invoice to
+            # show and never was one — by design. Say that here, where the
+            # table would be, rather than leaving the pane empty and letting it
+            # read as a run that broke.
+            st.warning(
+                "**Quarantined at ingestion.** This document forged the pipeline's own "
+                "prompt fences, so it was stopped before the Extractor and never shown to "
+                "a language model. Nothing was extracted from it — read the original "
+                "below and decide by hand."
+            )
         if inv is not None:
             st.markdown(f"**{inv.invoice_number}** · {inv.vendor or '_no vendor_'}")
             st.dataframe(
@@ -282,7 +308,9 @@ def render_run(result: InvoiceRunResult, *, actionable: bool = False, scope: str
                 st.markdown("🟢 All checks passed")
         render_verdicts(result)
 
-    with st.expander("Original document"):
+    # Open by default when there is no invoice above it: for a quarantined run
+    # the document itself is the only thing a reviewer can judge.
+    with st.expander("Original document", expanded=inv is None and not running):
         render_source(result, scope)
 
     with st.expander("Activity log"):
@@ -339,7 +367,7 @@ def run_fields(result: InvoiceRunResult) -> tuple[str, str, str, str, str]:
     inv = result.invoice
     badge = IN_FLIGHT_BADGE if in_flight(result) else STATUS_BADGE[result.final_status]
     number = inv.invoice_number if inv else "—"
-    who = (inv.vendor or "unknown vendor") if inv else result.source_file_path.rsplit("/", 1)[-1]
+    who = (inv.vendor or "unknown vendor") if inv else Path(result.source_file_path).name
     amount = f"{inv.currency} {inv.total:,.2f}" if inv and inv.total else "—"
     return badge, number, who, amount, result.started_at[:16].replace("T", " ")
 
@@ -352,6 +380,15 @@ SOURCE_MIME = {
     "txt": "text/plain",
     "pdf": "application/pdf",
 }
+
+
+def shown_path(path: Path) -> str:
+    """A source path as a reader can place it: relative to the project when it
+    lives there, absolute when it does not."""
+    try:
+        return str(path.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(path)
 
 
 def render_source(result: InvoiceRunResult, scope: str) -> None:
@@ -367,6 +404,10 @@ def render_source(result: InvoiceRunResult, scope: str) -> None:
     doc = store.document_for_run(result.run_id)
     path = Path(result.source_file_path)
 
+    # Where the file came from, for anyone reconciling a run against the disk.
+    # Here rather than in the heading above: it is a server-side detail, and
+    # for a run with no invoice it used to be the *entire* title.
+    st.caption(f"Source: `{shown_path(path)}`")
     if path.exists():
         suffix = path.suffix.lstrip(".").lower()
         st.download_button(
@@ -385,7 +426,7 @@ def render_source(result: InvoiceRunResult, scope: str) -> None:
                 # download and the extracted text below still work.
                 st.caption("Install `streamlit[pdf]` to preview the page inline.")
     else:
-        st.caption(f"The original file is no longer on disk ({result.source_file_path}).")
+        st.caption("The original file is no longer on disk.")
 
     if doc is None:
         st.caption("Nothing was recorded — this run failed before it could read the file.")
@@ -434,11 +475,18 @@ def run_row(result: InvoiceRunResult) -> None:
 
 
 def run_header(result: InvoiceRunResult) -> str:
-    return (
-        f"{result.invoice.invoice_number} · {result.invoice.vendor or 'unknown vendor'}"
-        if result.invoice
-        else result.source_file_path
-    )
+    """The title of one run's panel.
+
+    Without an invoice there is no number and no vendor to name it by — a
+    quarantined document was never extracted, and a failed one never got that
+    far. The file it arrived as is all that is left, so use its name and say
+    why it is standing in. The full path is a server-side detail: it belongs in
+    the source pane below, not in a heading.
+    """
+    if result.invoice:
+        return f"{result.invoice.invoice_number} · {result.invoice.vendor or 'unknown vendor'}"
+    name = Path(result.source_file_path).name or "unnamed document"
+    return f"{name} · {'quarantined, never extracted' if quarantined(result) else 'not extracted'}"
 
 
 @st.cache_resource(show_spinner=False)

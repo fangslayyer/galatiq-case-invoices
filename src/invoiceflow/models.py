@@ -330,6 +330,52 @@ class PrecedentBundle(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Vendor window — what else this vendor billed, close in time
+# ---------------------------------------------------------------------------
+
+
+class RecentInvoice(BaseModel):
+    """One invoice already in the registry, as the scrutiny rule needs to read it.
+
+    Deliberately thin: an invoice number, a date, a sum and where it stands.
+    Nothing here re-decides a prior invoice — it is counted, not re-judged.
+    """
+
+    invoice_number: str
+    #: Verbatim, exactly as recorded. `vendor_key` is the one place that decides
+    #: when two spellings are one company, so this must not arrive normalised.
+    vendor: str = ""
+    invoice_date: date | None = None
+    total: float = 0.0
+    final_status: FinalStatus = FinalStatus.PAID
+
+    def summary_line(self) -> str:
+        """How this invoice is cited in a scrutiny reason a person will read."""
+        when = f", {self.invoice_date}" if self.invoice_date else ""
+        return f"{self.invoice_number} (${self.total:,.2f}{when}, {self.final_status})"
+
+
+class VendorWindow(BaseModel):
+    """The same vendor's *other* invoices dated within `days` of this one.
+
+    The scrutiny threshold is a rule about money leaving the company, and money
+    does not care how many pages it was billed on. This is the population the
+    rule engine applies it to: three invoices of $4,860, $4,320 and $5,400 four
+    days apart are one $14,580 payment as far as the threshold is concerned.
+
+    Empty is the normal case and means exactly what it says — nothing else from
+    this vendor is close enough in time to be part of the same payment.
+    """
+
+    days: int = 0
+    invoices: list[RecentInvoice] = Field(default_factory=list)
+
+    @property
+    def total(self) -> float:
+        return sum(i.total for i in self.invoices)
+
+
+# ---------------------------------------------------------------------------
 # Approval (Approver + Critic agent outputs)
 # ---------------------------------------------------------------------------
 

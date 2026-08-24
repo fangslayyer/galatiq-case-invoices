@@ -7,13 +7,17 @@ every artifact of a run lands, joins correctly, and comes back verbatim.
 
 import re
 import sqlite3
+import threading
 
 import pytest
 
+from invoiceflow import runstore
 from invoiceflow.models import FinalStatus, IssueCode
 from invoiceflow.pipeline import export_result_json
 from invoiceflow.runstore import (
     ISSUE_CATEGORIES,
+    MODEL_PRICING,
+    PRICING_EFFECTIVE_FROM,
     SCHEMA_PATH,
     RunStore,
     _created_object,
@@ -145,6 +149,108 @@ class TestSchema:
         again = _object_shapes_of(RunStore(path))
         assert first == again
         assert not any(name.endswith("__new") for name in first)
+
+    def test_a_rebuilt_table_is_rebuilt_once_and_never_again(self, tmp_path, monkeypatch):
+        """The shape check above cannot see this: a rebuild leaves the table
+        looking exactly as it did, so rebuilding on every open looks identical
+        to not rebuilding at all. It is not identical — SQLite stores the
+        renamed table as CREATE TABLE "rule_reasons", and comparing that with
+        schema.sql's unquoted name kept the rebuild firing forever, copying
+        live rows on every open of the dashboard."""
+        path = tmp_path / "older.db"
+        conn = sqlite3.connect(path)
+        conn.executescript(_pre_precedent_schema())
+        conn.close()
+
+        rebuilt: list[str] = []
+        real = runstore._rebuild_table
+
+        def spy(conn, name, statement):
+            rebuilt.append(name)
+            return real(conn, name, statement)
+
+        monkeypatch.setattr(runstore, "_rebuild_table", spy)
+        RunStore(path)
+        RunStore(path)
+        RunStore(path)
+        assert rebuilt == ["rule_reasons"]
+
+    def test_two_threads_can_open_the_same_database_at_once(self, tmp_path):
+        """What the dashboard actually does: a store per Streamlit script run
+        and another on the inbox worker, several of them alive at the same
+        moment. Both used to survey the schema and then change it with nothing
+        holding the two together, so an upload during the Inbox tab's two-second
+        poll died on `table rule_reasons__new already exists`."""
+        path = tmp_path / "older.db"
+        conn = sqlite3.connect(path)
+        conn.executescript(_pre_precedent_schema())
+        conn.execute(
+            "INSERT INTO runs (run_id, source_path, started_at, final_status) "
+            "VALUES ('older-0001', 'x.txt', '2026-01-01T00:00:00+00:00', 'paid')"
+        )
+        conn.execute(
+            "INSERT INTO rule_evaluations (run_id, must_reject, must_review, "
+            "requires_scrutiny, scrutiny_threshold) VALUES (1, 0, 0, 0, 10000)"
+        )
+        conn.execute(
+            "INSERT INTO rule_reasons (rule_evaluation_id, kind, reason) "
+            "VALUES (1, 'advisory', 'something older')"
+        )
+        conn.commit()
+        conn.close()
+
+        failures: list[str] = []
+        start = threading.Barrier(6)
+
+        def open_store() -> None:
+            start.wait()  # all six inside _ensure_schema together, not in turn
+            try:
+                RunStore(path)
+            except Exception as exc:  # a thread's traceback goes nowhere; collect it
+                failures.append(f"{type(exc).__name__}: {exc}")
+
+        threads = [threading.Thread(target=open_store) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert not failures
+        with RunStore(path).connect() as conn:
+            kept = [r["reason"] for r in conn.execute("SELECT reason FROM rule_reasons")]
+            assert kept == ["something older"]  # six rebuilds, one row, still one row
+            names = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master")}
+            assert not any(name.endswith("__new") for name in names)
+
+    def test_an_abandoned_rebuild_does_not_wedge_the_database(self, tmp_path):
+        """Scaffolding left by an interrupted rebuild used to be permanent: the
+        next open tried to create it again and raised, so every open after that
+        one raised too. It is cleared instead, and the real table's rows — the
+        scaffold never holds one they do not — are untouched."""
+        path = tmp_path / "older.db"
+        conn = sqlite3.connect(path)
+        conn.executescript(_pre_precedent_schema())
+        conn.execute(
+            "INSERT INTO runs (run_id, source_path, started_at, final_status) "
+            "VALUES ('older-0001', 'x.txt', '2026-01-01T00:00:00+00:00', 'paid')"
+        )
+        conn.execute(
+            "INSERT INTO rule_evaluations (run_id, must_reject, must_review, "
+            "requires_scrutiny, scrutiny_threshold) VALUES (1, 0, 0, 0, 10000)"
+        )
+        conn.execute(
+            "INSERT INTO rule_reasons (rule_evaluation_id, kind, reason) "
+            "VALUES (1, 'advisory', 'something older')"
+        )
+        conn.execute("CREATE TABLE rule_reasons__new (id INTEGER PRIMARY KEY)")
+        conn.commit()
+        conn.close()
+
+        with RunStore(path).connect() as conn:
+            kept = [r["reason"] for r in conn.execute("SELECT reason FROM rule_reasons")]
+            assert kept == ["something older"]
+            names = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master")}
+            assert not any(name.endswith("__new") for name in names)
 
     def test_a_new_issue_code_reaches_an_existing_database(self, store):
         """Adding an IssueCode must not require a hand-written migration.
@@ -377,6 +483,75 @@ class TestTelemetryPricing:
                 (priced.run_id,),
             ).fetchone()["c"]
         assert cost2 == pytest.approx(expected, abs=1e-4)
+
+    def test_the_backend_is_priced_out_of_the_box(self, store):
+        """A fresh database already knows what Grok costs — otherwise the first
+        thing anybody sees on the dashboard is a dash where the money goes."""
+        with store.connect() as conn:
+            rows = {r["model"]: r for r in conn.execute("SELECT * FROM model_pricing")}
+        assert set(rows) == set(MODEL_PRICING)
+        seeded, rate = rows["grok-4.6"], MODEL_PRICING["grok-4.6"]
+        assert seeded["input_usd_per_mtok"] == rate.input_usd_per_mtok
+        assert seeded["cached_input_usd_per_mtok"] == rate.cached_input_usd_per_mtok
+        assert seeded["output_usd_per_mtok"] == rate.output_usd_per_mtok
+        # Below any timestamp a call can carry, so history prices too.
+        assert seeded["effective_from"] < "1971"
+
+    def test_a_hand_set_rate_survives_a_later_init(self, store):
+        """The seed states a published price; it does not overrule one somebody
+        put there on purpose."""
+        store.set_model_pricing(
+            "grok-4.6",
+            input_usd_per_mtok=99.0,
+            output_usd_per_mtok=99.0,
+            effective_from=PRICING_EFFECTIVE_FROM,
+        )
+        store.init()
+        with store.connect() as conn:
+            row = conn.execute("SELECT * FROM model_pricing WHERE model = 'grok-4.6'").fetchone()
+        assert row["input_usd_per_mtok"] == 99.0
+
+    def test_init_prices_calls_recorded_before_the_rate_existed(self, pipeline):
+        """Costs that were NULL because no price was on file get one; costs
+        already snapshotted are left exactly as they were billed."""
+        run = pipeline.run(INVOICES_DIR / "invoice_1001.txt")
+        _, _, cost = pipeline.store.run_usage(run.run_id)
+        assert cost is None  # FakeBrain is not a priced model
+
+        pipeline.store.set_model_pricing(
+            "FakeBrain",
+            input_usd_per_mtok=1.0,
+            output_usd_per_mtok=5.0,
+            effective_from="2000-01-01",
+        )
+        assert pipeline.store.init() == 6  # the six calls of that first run
+        _, _, backfilled = pipeline.store.run_usage(run.run_id)
+        # v_run_summary rounds to the cent's cent, like the first test here.
+        assert backfilled == pytest.approx(
+            _expected_cost(pipeline.store, run.run_id, 1.0, 5.0), abs=1e-4
+        )
+
+        # Idempotent, and never a re-pricing: a second init at a new rate
+        # leaves the snapshot alone.
+        pipeline.store.set_model_pricing(
+            "FakeBrain",
+            input_usd_per_mtok=1000.0,
+            output_usd_per_mtok=1000.0,
+            effective_from="2001-01-01",
+        )
+        assert pipeline.store.init() == 0
+        _, _, unchanged = pipeline.store.run_usage(run.run_id)
+        assert unchanged == pytest.approx(backfilled, abs=1e-9)
+
+
+def _expected_cost(store, run_id: str, in_rate: float, out_rate: float) -> float:
+    with store.connect() as conn:
+        return conn.execute(
+            "SELECT SUM((lc.input_tokens * ? + lc.output_tokens * ?) / 1e6) AS c "
+            "FROM llm_calls lc JOIN agent_invocations ai ON ai.id = lc.invocation_id "
+            "JOIN runs r ON r.id = ai.run_id WHERE r.run_id = ?",
+            (in_rate, out_rate, run_id),
+        ).fetchone()["c"]
 
 
 class TestReprocessDetection:

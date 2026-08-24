@@ -1,0 +1,30 @@
+{
+  "invoice_number": "INV-6002",
+  "vendor": "Contoso Supply Co.",
+  "invoice_date": "2026-05-06",
+  "due_date": "2026-06-05",
+  "due_date_raw": null,
+  "line_items": [
+    {
+      "item": "WidgetA",
+      "quantity": 10,
+      "unit_price": 250.0,
+      "line_total": 2500.0,
+      "note": null
+    },
+    {
+      "item": "WidgetB",
+      "quantity": 3,
+      "unit_price": 500.0,
+      "line_total": 1500.0,
+      "note": null
+    }
+  ],
+  "subtotal": 4000.0,
+  "tax_amount": 320.0,
+  "extra_charges": 0.0,
+  "total": 4320.0,
+  "currency": "USD",
+  "payment_terms": "Net 30",
+  "notes": ""
+}

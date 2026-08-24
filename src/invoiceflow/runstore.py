@@ -27,8 +27,9 @@ import json
 import re
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 from .models import (
     ApprovalDecision,
@@ -44,6 +45,7 @@ from .models import (
     PaymentResult,
     PaymentStatus,
     PrecedentBundle,
+    RecentInvoice,
     RuleReasonKind,
     Severity,
     TraceEvent,
@@ -77,6 +79,22 @@ ISSUE_CATEGORIES: dict[IssueCode, str] = {
     IssueCode.PROMPT_INJECTION_ATTEMPT: "prompt_safety",
     IssueCode.AGENT_OBSERVATION: "agent",
 }
+
+
+class ModelRate(NamedTuple):
+    """One model's published rate, USD per million tokens."""
+
+    input_usd_per_mtok: float
+    cached_input_usd_per_mtok: float | None
+    output_usd_per_mtok: float
+
+
+MODEL_PRICING: dict[str, ModelRate] = {
+    "grok-4.6": ModelRate(2.00, 0.50, 6.00),
+}
+
+PRICING_EFFECTIVE_FROM = "1970-01-01"
+
 
 #: decision_overrides.kind -> runs.decision_source
 _OVERRIDE_SOURCE = {
@@ -112,23 +130,45 @@ _REBUILDABLE = {"rule_reasons"}
 
 
 def _canonical(sql: str) -> str:
-    """A CREATE statement reduced to what it actually declares — comments and
-    whitespace removed — so a stored one can be compared with a fresh one."""
-    return re.sub(r"\s+", " ", re.sub(r"--[^\n]*", "", sql)).strip()
+    """A CREATE statement reduced to what it actually declares — comments,
+    whitespace, the trailing semicolon and any quoting of the declared name
+    removed — so a stored one can be compared with a fresh one.
+
+    The unquoting is the load-bearing part. `_rebuild_table` finishes with
+    ALTER TABLE ... RENAME TO, and SQLite rewrites the declaration it keeps as
+    `CREATE TABLE "rule_reasons"` when it does. Compared literally against
+    schema.sql's unquoted `CREATE TABLE rule_reasons` that never matches again,
+    so a table rebuilt once is rebuilt on every open forever — pointless work
+    over live rows, and the only reason two opens ever collide mid-rebuild.
+    """
+    body = re.sub(r"\s+", " ", re.sub(r"--[^\n]*", "", sql)).strip().rstrip(";").strip()
+    return re.sub(r'^(CREATE (?:TABLE|VIEW|INDEX) )"([^"]+)"', r"\1\2", body, flags=re.IGNORECASE)
 
 
 def _rebuild_table(conn: sqlite3.Connection, name: str, statement: str) -> None:
     """Recreate `name` from `statement`, carrying every column both versions
-    share. SQLite's own recommended dance for a constraint change."""
+    share. SQLite's own recommended dance for a constraint change.
+
+    The scaffolding is dropped before it is created, because a half-finished
+    rebuild is exactly what leaves one behind: sqlite3 opens a transaction for
+    DML but not for DDL, so an attempt made outside `_grow_schema`'s explicit
+    one committed its CREATE and then failed, after which every later open died
+    on "table rule_reasons__new already exists". A database wedged that way
+    heals on the next open instead of staying wedged. Its rows are safe: this
+    runs only when `name` itself still exists, and the scaffold never holds a
+    row that table does not.
+    """
+    scaffold = f"{name}__new"
+    conn.execute(f"DROP TABLE IF EXISTS {scaffold}")
     conn.execute(
-        re.sub(rf"\bCREATE TABLE {name}\b", f"CREATE TABLE {name}__new", statement, count=1)
+        re.sub(rf"\bCREATE TABLE {name}\b", f"CREATE TABLE {scaffold}", statement, count=1)
     )
     old = [row[1] for row in conn.execute(f"PRAGMA table_info({name})")]
-    new = {row[1] for row in conn.execute(f"PRAGMA table_info({name}__new)")}
+    new = {row[1] for row in conn.execute(f"PRAGMA table_info({scaffold})")}
     shared = ", ".join(column for column in old if column in new)
-    conn.execute(f"INSERT INTO {name}__new ({shared}) SELECT {shared} FROM {name}")
+    conn.execute(f"INSERT INTO {scaffold} ({shared}) SELECT {shared} FROM {name}")
     conn.execute(f"DROP TABLE {name}")
-    conn.execute(f"ALTER TABLE {name}__new RENAME TO {name}")
+    conn.execute(f"ALTER TABLE {scaffold} RENAME TO {name}")
 
 
 def _statements(script: str):
@@ -156,7 +196,7 @@ def _created_object(statement: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _grow_schema(conn: sqlite3.Connection, existing: set[str]) -> None:
+def _grow_schema(conn: sqlite3.Connection) -> None:
     """Bring a database created by an older revision up to schema.sql.
 
     Additive only, and deliberately not a migration framework: every object the
@@ -170,24 +210,43 @@ def _grow_schema(conn: sqlite3.Connection, existing: set[str]) -> None:
     was making somebody's audit trail the price of an upgrade, which is a strange
     thing for an audit trail to cost.
     """
-    # Columns before objects, not the other way round: a new view can select a
-    # new column, and creating it against a table that has not grown one yet
-    # leaves a view that parses now and fails the first time it is queried.
-    for table, column, declaration in _ADDED_COLUMNS:
-        if table not in existing:
-            continue
-        held = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-        if column not in held:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
-    declared = {r["name"]: r["sql"] for r in conn.execute("SELECT name, sql FROM sqlite_master")}
-    for statement in _statements(SCHEMA_PATH.read_text()):
-        name = _created_object(statement)
-        if name is None:
-            continue
-        if name not in existing:
-            conn.execute(statement)
-        elif name in _REBUILDABLE and _canonical(declared[name]) != _canonical(statement):
-            _rebuild_table(conn, name, statement)
+    # One writer at a time, and the survey taken under the same lock that the
+    # changes are: every step below reads what the database has before altering
+    # it, which is precisely the shape that breaks when somebody else alters it
+    # in between. The dashboard opens a store on each script run and another on
+    # its inbox worker, so these do overlap in the wild — and the collision was
+    # not theoretical, it was two threads rebuilding rule_reasons at once.
+    # IMMEDIATE takes the write lock at BEGIN rather than at the first write,
+    # so the loser waits out `busy_timeout` and then finds the work already
+    # done, instead of creating a table that by then exists.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master")}
+        # Columns before objects, not the other way round: a new view can select
+        # a new column, and creating it against a table that has not grown one
+        # yet leaves a view that parses now and fails the first time it is
+        # queried.
+        for table, column, declaration in _ADDED_COLUMNS:
+            if table not in existing:
+                continue
+            held = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in held:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+        declared = {
+            r["name"]: r["sql"] for r in conn.execute("SELECT name, sql FROM sqlite_master")
+        }
+        for statement in _statements(SCHEMA_PATH.read_text()):
+            name = _created_object(statement)
+            if name is None:
+                continue
+            if name not in existing:
+                conn.execute(statement)
+            elif name in _REBUILDABLE and _canonical(declared[name]) != _canonical(statement):
+                _rebuild_table(conn, name, statement)
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
 
 
 @dataclass(frozen=True)
@@ -253,7 +312,7 @@ class RunStore:
                 conn.execute("PRAGMA journal_mode = WAL")  # persistent, set once
                 conn.executescript(SCHEMA_PATH.read_text())
             else:
-                _grow_schema(conn, existing)
+                _grow_schema(conn)
             # Re-seeded on every init, not only at creation. issue_codes is a
             # lookup table that validation_issues.code holds a live foreign key
             # to, so a code added to the IssueCode enum has to reach databases
@@ -264,13 +323,63 @@ class RunStore:
                 "INSERT OR IGNORE INTO issue_codes (code, category) VALUES (?, ?)",
                 [(code.value, cat) for code, cat in ISSUE_CATEGORIES.items()],
             )
+            # Same reasoning, same place: the backend's published rate is a
+            # fact about the model, not about this database, so a fresh one
+            # knows it and an existing one learns it. OR IGNORE, because a rate
+            # somebody set by hand at this key is theirs, not ours — and a
+            # genuine price change arrives as a later-dated row, which
+            # _price_call prefers anyway.
+            conn.executemany(
+                "INSERT OR IGNORE INTO model_pricing (model, effective_from, "
+                "input_usd_per_mtok, cached_input_usd_per_mtok, output_usd_per_mtok) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [(model, PRICING_EFFECTIVE_FROM, *rate) for model, rate in MODEL_PRICING.items()],
+            )
 
-    def init(self, *, reset: bool = False) -> None:
-        """Create the database; with reset, drop it and start fresh (D11)."""
+    def init(self, *, reset: bool = False) -> int:
+        """Create the database; with reset, drop it and start fresh (D11).
+
+        Returns how many previously unpriced LLM calls the seeded rates could
+        put a number on — zero after a reset, by definition.
+        """
         if reset:
             for suffix in ("", "-wal", "-shm"):
                 Path(f"{self.path}{suffix}").unlink(missing_ok=True)
         self._ensure_schema()
+        with self.connect() as conn:
+            return self._price_unpriced_calls(conn)
+
+    @staticmethod
+    def _price_unpriced_calls(conn: sqlite3.Connection) -> int:
+        """Fill in the cost of calls that were recorded before their model had a
+        price, and return how many were priced.
+
+        Not a re-pricing: rows with a cost keep it, because that cost is the
+        snapshot of what the call was billed at. NULL is not a snapshot of
+        anything — it is the record of us not knowing — so filling it from the
+        rate now on file rewrites no history. The arithmetic is _price_call's,
+        in SQL, over the newest rate effective at or before each call.
+
+        Run from init() rather than from _ensure_schema: opening the store is
+        something the dashboard does constantly and should stay read-shaped,
+        while `--init-db` is somebody asking for the database to be put in
+        order.
+        """
+        cur = conn.execute(
+            "UPDATE llm_calls SET cost_usd = ("
+            "  SELECT (MAX(llm_calls.input_tokens - llm_calls.cached_input_tokens, 0)"
+            "            * p.input_usd_per_mtok"
+            "          + llm_calls.cached_input_tokens"
+            "            * COALESCE(p.cached_input_usd_per_mtok, p.input_usd_per_mtok)"
+            "          + llm_calls.output_tokens * p.output_usd_per_mtok) / 1000000.0"
+            "  FROM model_pricing p"
+            "  WHERE p.model = llm_calls.model AND p.effective_from <= llm_calls.started_at"
+            "  ORDER BY p.effective_from DESC LIMIT 1) "
+            "WHERE cost_usd IS NULL AND EXISTS ("
+            "  SELECT 1 FROM model_pricing p"
+            "  WHERE p.model = llm_calls.model AND p.effective_from <= llm_calls.started_at)"
+        )
+        return cur.rowcount
 
     # -- intake -------------------------------------------------------------
 
@@ -992,6 +1101,55 @@ class RunStore:
                 (FinalStatus.PAID.value,),
             ).fetchall()
         return [r["vendor"] for r in rows]
+
+    def invoices_dated_near(self, on: date, days: int) -> list[RecentInvoice]:
+        """Every registered invoice dated within `days` of `on` — any vendor.
+
+        Read from `invoice_registry` rather than from `runs`, for the reason
+        `paid_vendors` gives: the registry is one row per invoice number at its
+        current standing, so a re-run counts once and a human override counts as
+        what the person decided rather than as what the pipeline first said.
+
+        Two statuses only. `rejected` is left out because no money will move on
+        it, and a rejection must not push the next honest invoice over a
+        threshold. `needs_review` is counted even though nothing has been paid
+        yet: it is money queued to leave, and the question this feeds is how much
+        is heading out of the door in this window. `duplicate` and `failed` runs
+        never reach the registry at all.
+
+        The vendor comes back verbatim and unmatched — `vendor_key`
+        (precedent.py) is the single place that decides when two spellings are
+        one company, and a normalisation that gates automatic payment must not
+        have a second implementation in SQL. The join to `invoices` is what
+        supplies the date the vendor stamped on the document, which the registry
+        does not carry; a registry row whose run predates that table, or whose
+        run_pk was never set, drops out of the window rather than being counted
+        at an unknown date.
+        """
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT reg.invoice_number, reg.vendor, reg.total, reg.final_status, "
+                "i.invoice_date FROM invoice_registry reg "
+                "JOIN invoices i ON i.run_id = reg.last_run_id "
+                "WHERE reg.final_status IN (?, ?) AND reg.total IS NOT NULL "
+                "AND i.invoice_date BETWEEN ? AND ?",
+                (
+                    FinalStatus.PAID.value,
+                    FinalStatus.NEEDS_REVIEW.value,
+                    str(on - timedelta(days=days)),
+                    str(on + timedelta(days=days)),
+                ),
+            ).fetchall()
+        return [
+            RecentInvoice(
+                invoice_number=r["invoice_number"],
+                vendor=r["vendor"],
+                invoice_date=r["invoice_date"],
+                total=r["total"],
+                final_status=FinalStatus(r["final_status"]),
+            )
+            for r in rows
+        ]
 
     def invoice_for_run(self, run_id: str) -> Invoice | None:
         """The invoice one run extracted.

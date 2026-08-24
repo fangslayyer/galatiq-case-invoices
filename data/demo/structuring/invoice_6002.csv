@@ -1,0 +1,17 @@
+field,value
+invoice_number,INV-6002
+vendor,Contoso Supply Co.
+date,2026-05-06
+due_date,2026-06-05
+item,WidgetA
+quantity,10
+unit_price,250.00
+amount,2500.00
+item,WidgetB
+quantity,3
+unit_price,500.00
+amount,1500.00
+subtotal,4000.00
+tax,320.00
+total,4320.00
+payment_terms,Net 30

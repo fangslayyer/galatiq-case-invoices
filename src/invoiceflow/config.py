@@ -60,6 +60,16 @@ class Settings(BaseSettings):
 
     # Business rules
     scrutiny_threshold: float = 10_000.0  # invoices above this get extra scrutiny
+    #: How close together a vendor's invoices have to be for that threshold to be
+    #: applied to their sum instead of to each document (structuring.py). A
+    #: fortnight is a billing cycle: long enough that a payment split across a few
+    #: days is still recognisably one payment, short enough that a vendor with
+    #: genuine weekly deliveries is not permanently flagged. Deployment
+    #: configuration rather than policy-in-code, unlike the precedent weights,
+    #: because it describes this company's buying rhythm — a business that orders
+    #: monthly and one that orders daily want different numbers here, and neither
+    #: is an argument about what evidence is worth.
+    structuring_window_days: int = 14
     expected_currency: str = "USD"
     max_extraction_retries: int = 2
     max_critique_rounds: int = 2

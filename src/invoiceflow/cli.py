@@ -76,16 +76,28 @@ def main(
             return
 
     if init_db or reset_db:
-        from .runstore import RunStore
+        from .runstore import MODEL_PRICING, RunStore
 
         db.init(reset=reset_db)
-        RunStore(settings.runs_db_path).init(reset=reset_db)
+        priced = RunStore(settings.runs_db_path).init(reset=reset_db)
         console.print(
             f"[green]✓[/green] Inventory database ready at [bold]{settings.db_path}[/bold]"
         )
         for rec in db.all_items():
             console.print(f"   {rec.item}: {rec.stock} in stock")
         console.print(f"[green]✓[/green] Run store ready at [bold]{settings.runs_db_path}[/bold]")
+        for name, rate in MODEL_PRICING.items():
+            cached = (
+                f"${rate.cached_input_usd_per_mtok:.2f} cached / "
+                if rate.cached_input_usd_per_mtok is not None
+                else ""
+            )
+            console.print(
+                f"   {name}: ${rate.input_usd_per_mtok:.2f} in / {cached}"
+                f"${rate.output_usd_per_mtok:.2f} out per Mtok"
+            )
+        if priced:
+            console.print(f"   [dim]priced {priced} LLM call(s) recorded before the rates[/dim]")
         if not (invoice_path or process_all):
             return
 

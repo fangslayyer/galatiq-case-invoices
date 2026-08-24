@@ -12,8 +12,11 @@ INVOICES_DIR = PROJECT_ROOT / "data" / "invoices"
 #: Authored by us, unlike INVOICES_DIR, which is provided case material — the
 #: learning demo's two vendor histories (data/demo/precedent/README.md).
 DEMO_DIR = PROJECT_ROOT / "data" / "demo" / "precedent"
+#: Likewise ours: one vendor's payment, split across three invoices
+#: (data/demo/structuring/README.md).
+STRUCTURING_DIR = PROJECT_ROOT / "data" / "demo" / "structuring"
 EXTRACTIONS_DIR = Path(__file__).parent / "fixtures" / "extractions"
-DOCUMENT_DIRS = (INVOICES_DIR, DEMO_DIR)
+DOCUMENT_DIRS = (INVOICES_DIR, DEMO_DIR, STRUCTURING_DIR)
 
 
 @pytest.fixture(scope="session")

@@ -19,6 +19,7 @@ from .models import (
     Severity,
     ValidationIssue,
     ValidationReport,
+    VendorWindow,
 )
 
 #: Findings that always end with a person reading the document, whatever their
@@ -174,6 +175,35 @@ def _discharged_reason(issue: ValidationIssue, precedents: PrecedentBundle | Non
     )
 
 
+def _split_payment_reason(
+    invoice: Invoice, window: VendorWindow | None, scrutiny_threshold: float
+) -> str | None:
+    """The scrutiny reason when this vendor only clears the threshold in
+    aggregate, or None when nothing about the window says so.
+
+    Called only for an invoice under the threshold on its own: over it, the plain
+    rule has already fired and a second reason would say the same thing twice.
+
+    Nothing is claimed about intent, and the wording says so — several sums under
+    the threshold, days apart, from one vendor, is a *shape*. It may be three
+    deliveries. What it may not be is three invoices that each dodge the second
+    look the same money would have got on one page.
+    """
+    if window is None or not window.invoices or invoice.total is None:
+        return None
+    combined = invoice.total + window.total
+    if combined <= scrutiny_threshold:
+        return None
+    others = "; ".join(rec.summary_line() for rec in window.invoices)
+    return (
+        f"total ${invoice.total:,.2f} is under the ${scrutiny_threshold:,.0f} review threshold, "
+        f"but {invoice.vendor or 'this vendor'} has billed ${combined:,.2f} across "
+        f"{len(window.invoices) + 1} invoices dated within {window.days} days of each other — "
+        f"over the threshold together, under it one at a time. Scrutinise this as the one "
+        f"payment it adds up to. The others: {others}"
+    )
+
+
 class RuleConstraints(BaseModel):
     must_reject: bool = False
     reject_reasons: list[str] = Field(default_factory=list)
@@ -203,7 +233,16 @@ def evaluate_rules(
     report: ValidationReport,
     scrutiny_threshold: float,
     precedents: PrecedentBundle | None = None,
+    vendor_window: VendorWindow | None = None,
 ) -> RuleConstraints:
+    """The constraints one invoice puts on the Approver.
+
+    `vendor_window` is what else this vendor billed within a few days
+    (structuring.py). It is optional and defaults to nothing, because most
+    callers — every unit test, and any caller holding an invoice rather than a
+    run store — have no window to offer, and an absent one only ever means a
+    threshold applied to this page alone, which is where it was applied before.
+    """
     c = RuleConstraints()
     for issue in report.issues:
         # Precedent speaks first, and only where it is allowed to speak: never
@@ -254,4 +293,12 @@ def evaluate_rules(
         c.scrutiny_reasons.append(
             f"total ${invoice.total:,.2f} exceeds the ${scrutiny_threshold:,.0f} review threshold"
         )
+    else:
+        # Under the threshold on this page. The threshold is about money leaving
+        # the company, though, and money does not care how many pages it was
+        # billed on — so ask the same question of the vendor's whole window.
+        split = _split_payment_reason(invoice, vendor_window, scrutiny_threshold)
+        if split is not None:
+            c.requires_scrutiny = True
+            c.scrutiny_reasons.append(split)
     return c

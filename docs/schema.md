@@ -461,7 +461,10 @@ CREATE TABLE model_pricing (
 
 Cost is stored *and* recomputable: `llm_calls.cost_usd` freezes what each call
 actually cost under the prices of the day, `model_pricing` lets you re-price
-history when rates change. Keeping `model` per call rather than per turn also
+history when rates change. The backend's published rate ships seeded
+(`runstore.MODEL_PRICING`, re-applied on every init like `issue_codes`, and
+`INSERT OR IGNORE` so a hand-set rate stands), which is what makes a demo show
+money instead of a dash. Keeping `model` per call rather than per turn also
 means a future mixed-model run (cheap extractor, strong approver) re-prices
 correctly. Token source is `UsageMetadataCallbackHandler`
 (already in langchain-core 1.6.0), attached to the `config` dict `pipeline.py:83`

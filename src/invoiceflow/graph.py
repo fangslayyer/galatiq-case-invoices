@@ -38,6 +38,7 @@ from .recording import RunRecorder
 from .rules import evaluate_rules
 from .runstore import RunStore
 from .state import PipelineState
+from .structuring import lookup_vendor_window
 from .validation import ValidationContext, forged_fence_issue
 
 log = logging.getLogger(__name__)
@@ -201,9 +202,28 @@ def build_graph(settings: Settings, db: Database, store: RunStore, llm: BaseChat
         if precedents is None:
             precedents = lookup_precedents(store, state["invoice"], state["report"], settings)
             trace.extend(_precedent_events(precedents))
-        constraints = state.get("constraints") or evaluate_rules(
-            state["invoice"], state["report"], settings.scrutiny_threshold, precedents
-        )
+        constraints = state.get("constraints")
+        if constraints is None:
+            # Same caching argument as precedent above, and the same hazard: a
+            # redraft has to be judged against the window the first draft was.
+            window = lookup_vendor_window(store, state["invoice"], settings)
+            if window.invoices:
+                trace.append(
+                    _ev(
+                        "approval",
+                        "vendor_window",
+                        f"{len(window.invoices)} other invoice(s) from "
+                        f"{state['invoice'].vendor} dated within {window.days} days, "
+                        f"totalling ${window.total:,.2f}",
+                    )
+                )
+            constraints = evaluate_rules(
+                state["invoice"],
+                state["report"],
+                settings.scrutiny_threshold,
+                precedents,
+                window,
+            )
         # Offered only where history has something to say. On everything else the
         # Approver runs exactly as it did before precedent existed — no bound
         # schema, no extra round-trip (see run_approver).

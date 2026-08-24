@@ -335,6 +335,48 @@ class TestTheOriginalDocument:
         assert any("Widgets Inc" in c.value for c in at.code)
 
 
+class TestAQuarantinedDocument:
+    """A forged-fence document is stopped before the Extractor, so the run has
+    no invoice at all. Every pane that names a run by its invoice has to cope."""
+
+    def quarantined_upload(self, settings, fake_brain):
+        """The poisoned demo file, uploaded the way a person would send it —
+        so its path is the deep spool path, not something a title can borrow."""
+        from invoiceflow import inbox
+
+        source = PROJECT_ROOT / "data" / "demo" / "injection" / "invoice_5001.txt"
+        path = inbox.save_upload(settings.uploads_dir, source.name, source.read_bytes())
+        result = Pipeline(settings, llm=fake_brain).run(path)
+        assert result.final_status == FinalStatus.NEEDS_REVIEW
+        assert result.invoice is None  # the gate fired before extraction
+        return result
+
+    def test_it_is_titled_by_its_filename_not_its_path(self, settings, db, fake_brain, monkeypatch):
+        _export(monkeypatch, settings)
+        result = self.quarantined_upload(settings, fake_brain)
+
+        at = AppTest.from_file(APP, default_timeout=60).run()
+        assert not at.exception, [e.value for e in at.exception]
+        headings = [h.value for h in at.subheader]
+        assert "invoice_5001.txt · quarantined, never extracted" in headings
+        # The old title was the absolute path of the spooled upload.
+        assert not any(str(settings.uploads_dir) in h for h in headings)
+        assert result.source_file_path not in " ".join(headings)
+
+    def test_the_empty_invoice_pane_explains_itself(self, settings, db, fake_brain, monkeypatch):
+        _export(monkeypatch, settings)
+        self.quarantined_upload(settings, fake_brain)
+
+        at = AppTest.from_file(APP, default_timeout=60).run()
+        assert not at.exception, [e.value for e in at.exception]
+        assert any("Quarantined at ingestion" in w.value for w in at.warning)
+        # ...and the document it refers to is open, not folded away: it is the
+        # only thing a reviewer can actually read.
+        pane = next(e for e in at.expander if e.label == "Original document")
+        assert pane.proto.expanded
+        assert any("Meridian Office Supply" in c.value for c in at.code)
+
+
 def test_the_inbox_renders_finished_and_queued_rows_together(
     dashboard, settings, fake_brain, caplog
 ):

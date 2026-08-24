@@ -32,6 +32,13 @@ late — the attack lands during extraction. It is also never auto-rejected:
 deciding whether a forged fence is an attack or an OCR artifact is the one
 judgement no agent here is fit to make, so it goes to a human.
 
+Nine worked examples — seven attacks, one clean control and one honest false
+positive — are in [data/demo/injection/README.md](../data/demo/injection/README.md),
+with the outcome of each recorded from a real run. The set makes the narrower
+claim the architecture actually supports: on the forged-fence document no model
+was consulted at all, and on the other six no model had the authority to change
+the outcome.
+
 ### 3. Hard rules outrank the agents, and `must_review` outranks `must_reject` — shipped
 Deterministic constraints are computed before the Approver runs, and the graph
 enforces them regardless of what the agents concluded
@@ -122,7 +129,7 @@ committed mermaid source against the topology as compiled today.
 **Why it matters:** same principle as above — no external call on the hot path —
 without giving up the guarantee that the picture matches the code.
 
-### 12. 249 offline tests, plus a separate live suite — shipped
+### 12. 268 offline tests, plus a separate live suite — shipped
 The offline suite runs every sample file through the full graph with extraction
 answered from recorded ground-truth fixtures; the live suite verifies real Grok
 honours that contract. No API key needed to run the tests.
@@ -155,6 +162,16 @@ tokens, latency, model) under the agent turn that made it — not only in
 LangSmith, which is off by default. The CLI prints usage per run and per batch;
 `v_cost_by_agent` answers "where does the money go". Dollar cost appears once
 `model_pricing` holds your rates — never invented from a missing price.
+
+The backend's own rate is seeded on init, so it is on file before the first run
+rather than after somebody notices the dashboard showing a dash: grok-4.6 at
+$2.00 / $0.50 cached / $6.00 per million tokens, xAI's published price
+([docs.x.ai/docs/models](https://docs.x.ai/docs/models), read 2026-08-24). It is
+a floor, not a claim about history — a real rate change is a new row carrying
+the date it took effect, which is what `effective_from` is for, and a rate set
+by hand is never overwritten by the seed. `--init-db` also fills in calls
+recorded before any price was known; a cost already snapshotted is left alone,
+because that one is a record of what was billed.
 
 ### 15. Re-run detection at the document level — shipped
 The duplicate check is keyed on the *extracted* invoice number, so it only
@@ -299,6 +316,66 @@ which is the guard above and has to survive any rewrite of the scoring.
 The whole thing is demonstrable in the dashboard's **🎓 Learning** tab, over two
 vendor histories with deliberately different shapes:
 [data/demo/precedent/README.md](../data/demo/precedent/README.md).
+
+---
+
+## Threshold integrity
+
+### 20. Structuring — the $10K rule applied to the money, not to the page — shipped
+The brief's approval rule is "invoices over $10K require additional scrutiny",
+and the pipeline implemented it the way it is written: a comparison against
+`invoice.total`. That is a rule about a *document*, and a rule about a document
+is avoided by sending two of them. Splitting one payment into several under-limit
+invoices is old enough that banks have a word for it, and it costs a vendor
+nothing — three PDFs instead of one.
+
+The fix is not a new kind of finding. It is asking the same question of the right
+quantity: before the threshold is applied, [structuring.py](../src/invoiceflow/structuring.py)
+reads the registry for every other invoice the same vendor dated within a
+fortnight, and `evaluate_rules` compares the threshold against the sum. Three
+invoices of $4,860, $4,320 and $5,400 four days apart raise exactly the
+`requires_scrutiny` that one $14,580 invoice raises, in the same field, on the
+same terms, reaching the Approver and the Critic in the same block. Identical
+money, identical treatment — which is the entire claim, and the reason this is
+twenty lines of rule engine rather than a new taxonomy of fraud codes.
+
+**It is a scrutiny flag and deliberately nothing harder.** Three invoices in one
+week may be three deliveries; the pipeline can establish the pattern and cannot
+establish the intent. It does not reject, and it does not force a human the way
+`REVIEW_CODES` does — those are the findings where something could not be
+*established*, and here the arithmetic is established perfectly well. What the
+split may not do is buy a quieter path than the same money on one page. The
+scrutiny reason names the sibling invoices, their dates and their standing, so
+the next question a reviewer has — "which ones?" — is already answered.
+
+**What counts, and what conspicuously does not.** A `rejected` sibling is left
+out: no money moves on a rejection, and one must never push the next honest
+invoice over a threshold. An invoice still in the escalation queue is counted,
+because it is money queued to leave and the question is what is heading out of
+the door this fortnight. The invoice being decided is excluded by number, or a
+re-run or a revision would clear the threshold on its own back. Vendor identity
+goes through `vendor_key`, the same normalisation precedent uses, because a
+company spelled two ways must not be two payment histories — and a rule that
+gates automatic payment must not have a second implementation in SQL.
+
+**The window is configuration, unlike the precedent weights.** `structuring_window_days`
+describes a company's buying rhythm — a business that orders monthly and one that
+orders daily want different numbers — and that is a deployment fact, not an
+argument about what evidence is worth. It is symmetric in time, so an invoice
+dated back into a fortnight already paid is caught as readily as one arriving
+after it.
+
+**Day 2.** Three obvious extensions, none of them free. *Retroactive notice*: the
+first two invoices are paid before the pattern exists, and nothing today tells a
+reviewer that money already out of the door now looks like part of a split —
+worth a dashboard row, and it needs a rule for when to stop looking backwards.
+*Grouping on something better than the vendor name*: a purchase-order number or
+bank details would catch a split across two vendor spellings the normaliser does
+not join, and would also catch the reverse — a genuine coincidence of two
+unrelated orders in one week. *A rate, not a sum*: for a vendor who legitimately
+bills weekly, the signal is not the fortnight's total but a departure from their
+own baseline, which is a model over billing history and wants the data this store
+is already accumulating.
 
 ---
 

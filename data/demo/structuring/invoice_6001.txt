@@ -1,0 +1,18 @@
+CONTOSO SUPPLY CO.
+2280 Harbor Point Drive, Tacoma, WA 98402
+
+INVOICE
+
+Invoice Number: INV-6001
+Date: 2026-05-04
+Due Date: 2026-06-03
+
+Item        Qty    Unit Price    Amount
+WidgetA     14     $250.00       $3,500.00
+WidgetB     2      $500.00       $1,000.00
+
+Subtotal:        $4,500.00
+Sales tax 8%:    $360.00
+Total Due:       $4,860.00
+
+Payment Terms: Net 30
