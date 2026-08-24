@@ -86,7 +86,7 @@ graph TD
     F -- rejected --> L[Rejection log]
     F -- approved --> G{{"🤖 Payer"}}
     G <--> T2[(mock_payment<br/>idempotency registry)]
-    G --> H[results/*.json]
+    G --> H[invoiceflow.db]
     L --> H
     Q --> H
     H --> S[📊 Streamlit dashboard]
