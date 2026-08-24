@@ -17,10 +17,16 @@ cp .env.example .env                                       # put your XAI_API_KE
 uv run python main.py --init-db                            # create both DBs (inventory + run store)
 uv run python main.py --invoice_path=data/invoices/invoice_1001.txt
 uv run python main.py --all                                # batch: all 20 sample files
-uv run streamlit run ui/app.py                             # review dashboard
+uv run streamlit run ui/app.py                             # dashboard: upload, inbox, review
 uv run python main.py --export-graph                       # re-render docs/graph.png
 uv run python main.py --export-json all                    # render runs from the DB to results/
 ```
+
+The dashboard is self-sufficient: after `--init-db` you can start it on an empty
+database and upload invoices from the browser — 📤 Upload, top right. Files queue
+in the **Inbox** tab and are processed in the background, one at a time, by the
+same pipeline the CLI runs. The CLI remains the product for engineers; the
+dashboard is the product for the finance team.
 
 Grok is the pipeline's only brain — there is deliberately no rule-based
 fallback parser. "Offline" in the brief means the *surrounding* systems
@@ -140,7 +146,7 @@ self-edge on `ingest`, and the `decide`/`critique` cycle is right there:
 ## Testing & quality
 
 ```bash
-uv run pytest                      # 126 offline tests, ~10s, no API key needed
+uv run pytest                      # 187 offline tests, ~20s, no API key needed
 uv run pytest --cov=invoiceflow    # with coverage
 uv run pytest -m live              # against real Grok (needs XAI_API_KEY)
 uv run ruff check && uv run ruff format --check
@@ -207,8 +213,8 @@ src/invoiceflow/
   recording.py           per-run turn/LLM-call recorder (tokens, latency, cost)
   pipeline.py            run wrapper: Grok factory, run IDs, one-transaction persist
   cli.py                 rich terminal UI: per-stage trace, usage lines, batch summary
-ui/app.py                Streamlit dashboard: runs browser + escalation queue
-tests/                   130 tests (126 offline + 4 live-marked)
+ui/app.py                Streamlit dashboard: upload + inbox, runs browser, escalation queue
+tests/                   191 tests (187 offline + 4 live-marked)
 data/invoices/           provided sample invoices (the acceptance dataset)
 docs/graph.png|.mmd      compiled LangGraph topology (`--export-graph` re-renders)
 docs/beyond-the-brief.md additions beyond CASE.md, and why each one earns its place

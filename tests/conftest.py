@@ -35,6 +35,12 @@ def settings(tmp_path: Path) -> Settings:
         db_path=tmp_path / "inventory.db",
         runs_db_path=tmp_path / "invoiceflow.db",
         results_dir=tmp_path / "results",
+        uploads_dir=tmp_path / "uploads",
+        # Never a thread in the test suite: it would outlive the test, keep
+        # polling a tmp_path database pytest has deleted, and build a real
+        # ChatXAI because .env exports XAI_API_KEY. The worker's behaviour is
+        # tested through its synchronous half, inbox.drain().
+        inbox_worker=False,
     )
 
 

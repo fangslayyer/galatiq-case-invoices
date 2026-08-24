@@ -11,6 +11,13 @@ Write discipline (docs/schema.md D2):
   * `finish_run` writes every run artifact in ONE transaction at the end.
   * Only `invoice_registry` is mutated mid-run (the `record` node), because
     payment idempotency must be visible to the very next run.
+  * `inbox_items` is mutable too, but it is not a run artifact: it tracks a
+    file's journey through the queue, and the run it produced is a foreign key.
+
+Safe to share across threads, which the dashboard's inbox worker relies on:
+this object holds a path, never a connection, and every method opens and drops
+its own inside one call frame. sqlite3's `check_same_thread` therefore never
+fires.
 """
 
 from __future__ import annotations
@@ -80,6 +87,16 @@ _OVERRIDE_SOURCE = {
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+@dataclass(frozen=True)
+class InboxItem:
+    """One uploaded file, as the worker claims it off the queue."""
+
+    id: int
+    filename: str
+    stored_path: Path
+    content_sha256: str
 
 
 @dataclass(frozen=True)
@@ -164,6 +181,179 @@ class RunStore:
                 "SELECT COUNT(*) AS n FROM runs WHERE document_id = ?", (doc_id,)
             ).fetchone()["n"]
         return doc_id, prior
+
+    def document_history(self, raw_text: str) -> tuple[int | None, int]:
+        """(document_id, prior_run_count) for `raw_text`, WITHOUT registering it.
+
+        The read-only half of `register_document`, for the upload dialog's
+        pre-flight: it has to say "these exact bytes have been through the
+        pipeline N times" *before* the user commits, and six Grok calls are
+        spent (docs/beyond-the-brief.md §17). Registering here instead would
+        file a documents row whose `first_seen_path` names an upload the user
+        is about to skip — a lie in the one table whose whole job is identity.
+        """
+        digest = hashlib.sha256(raw_text.encode()).hexdigest()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM documents WHERE content_sha256 = ?", (digest,)
+            ).fetchone()
+            if row is None:
+                return None, 0
+            prior = conn.execute(
+                "SELECT COUNT(*) AS n FROM runs WHERE document_id = ?", (row["id"],)
+            ).fetchone()["n"]
+        return row["id"], prior
+
+    # -- inbox --------------------------------------------------------------
+
+    def enqueue_upload(
+        self,
+        *,
+        filename: str,
+        stored_path: str,
+        file_format: str,
+        byte_size: int,
+        content_sha256: str,
+        prior_runs: int,
+        source: str = "upload",
+    ) -> int:
+        """Add one file to the queue. Returns inbox_items.id."""
+        with self.connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO inbox_items (filename, stored_path, file_format, byte_size, "
+                "content_sha256, prior_runs, source, state, enqueued_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+                (
+                    filename,
+                    stored_path,
+                    file_format,
+                    byte_size,
+                    content_sha256,
+                    prior_runs,
+                    source,
+                    _now(),
+                ),
+            )
+            assert cur.lastrowid is not None
+            return cur.lastrowid
+
+    def claim_next_upload(self) -> InboxItem | None:
+        """Take the oldest queued item, atomically. None when the queue is empty.
+
+        One statement, not SELECT-then-UPDATE: the latter is a deferred
+        transaction upgrading read->write, and SQLite does NOT run the busy
+        handler for a snapshot-upgrade conflict, so `busy_timeout` would not
+        cover a second claimant. Doing it in one statement also means the queue
+        stays correct if a second worker is ever started — which Streamlit can
+        cause on its own, since its resource cache is clearable from the app's
+        ⋮ menu while the thread it cached keeps running.
+        """
+        with self.connect() as conn:
+            row = conn.execute(
+                "UPDATE inbox_items SET state = 'processing', started_at = ?, stage = '' "
+                "WHERE id = (SELECT id FROM inbox_items WHERE state = 'queued' "
+                "ORDER BY id LIMIT 1) RETURNING *",
+                (_now(),),
+            ).fetchone()
+        if row is None:
+            return None
+        return InboxItem(
+            id=row["id"],
+            filename=row["filename"],
+            stored_path=Path(row["stored_path"]),
+            content_sha256=row["content_sha256"],
+        )
+
+    def set_upload_stage(self, item_id: int, stage: str) -> None:
+        """Which graph node has the floor. Decoration for a live UI, never a
+        fact the pipeline reads back."""
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE inbox_items SET stage = ? WHERE id = ? AND state = 'processing'",
+                (stage, item_id),
+            )
+
+    def finish_upload(self, item_id: int, *, run_id: str | None = None, error: str = "") -> None:
+        """Close an item: `processed` when a run happened, `failed` when none did.
+
+        Note the asymmetry — a run that ended FAILED still leaves the item
+        `processed`, because the pipeline did its job and reached an honest
+        verdict. `failed` here means we never got a run out of this file at all.
+        The run FK is resolved in SQL so callers can stay in run_id space.
+        """
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE inbox_items SET state = ?, stage = '', finished_at = ?, error = ?, "
+                "run_id = (SELECT id FROM runs WHERE run_id = ?) WHERE id = ?",
+                ("failed" if error else "processed", _now(), error, run_id, item_id),
+            )
+
+    def requeue_upload(self, item_id: int) -> None:
+        """Put a finished item back in the queue — the Retry button.
+
+        The old run reference is cleared rather than kept: the retry produces
+        its own run, and the abandoned one stays in `runs` as the honest
+        `failed` row `begin_run` wrote.
+        """
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE inbox_items SET state = 'queued', stage = '', started_at = NULL, "
+                "finished_at = NULL, run_id = NULL, error = '' WHERE id = ?",
+                (item_id,),
+            )
+
+    def dismiss_upload(self, item_id: int) -> None:
+        """Clear it out of the list. The row stays — what we were handed and
+        when is a fact; `v_inbox` is what does the hiding."""
+        with self.connect() as conn:
+            conn.execute("UPDATE inbox_items SET dismissed_at = ? WHERE id = ?", (_now(), item_id))
+
+    def reclaim_stale_uploads(self) -> int:
+        """Close items a dead process left mid-flight, returning how many.
+
+        Two statements, and the order matters. An item can be stale because the
+        server died *between* `finish_run` committing and `finish_upload`
+        running, in which case a complete run exists and the item is
+        `processed`, not failed. `runs.source_path` is exactly
+        `inbox_items.stored_path`, and uploads have unique paths by
+        construction, so adopting that run is safe.
+        """
+        with self.connect() as conn:
+            adopted = conn.execute(
+                "UPDATE inbox_items SET state = 'processed', stage = '', finished_at = ?, "
+                "run_id = (SELECT r.id FROM runs r WHERE r.source_path = inbox_items.stored_path "
+                "          AND r.finished_at IS NOT NULL ORDER BY r.id DESC LIMIT 1) "
+                "WHERE state = 'processing' AND EXISTS ("
+                "    SELECT 1 FROM runs r WHERE r.source_path = inbox_items.stored_path "
+                "    AND r.finished_at IS NOT NULL)",
+                (_now(),),
+            ).rowcount
+            abandoned = conn.execute(
+                "UPDATE inbox_items SET state = 'failed', stage = '', finished_at = ?, error = ? "
+                "WHERE state = 'processing'",
+                (
+                    _now(),
+                    "The dashboard stopped while this file was being processed. Nothing was "
+                    "recorded for it — retry to run it again.",
+                ),
+            ).rowcount
+        return adopted + abandoned
+
+    def inbox_rows(self, limit: int = 200) -> list[dict]:
+        """Everything not dismissed, newest first."""
+        with self.connect() as conn:
+            return [
+                dict(r)
+                for r in conn.execute("SELECT * FROM v_inbox ORDER BY id DESC LIMIT ?", (limit,))
+            ]
+
+    def inbox_counts(self) -> dict[str, int]:
+        """state -> count. What the tab label and the polling interval read."""
+        with self.connect() as conn:
+            return {
+                r["state"]: r["n"]
+                for r in conn.execute("SELECT state, COUNT(*) AS n FROM v_inbox GROUP BY state")
+            }
 
     # -- run lifecycle ------------------------------------------------------
 

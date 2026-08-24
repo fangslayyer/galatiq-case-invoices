@@ -122,7 +122,7 @@ committed mermaid source against the topology as compiled today.
 **Why it matters:** same principle as above — no external call on the hot path —
 without giving up the guarantee that the picture matches the code.
 
-### 12. 110 offline tests, plus a separate live suite — shipped
+### 12. 187 offline tests, plus a separate live suite — shipped
 The offline suite runs every sample file through the full graph with extraction
 answered from recorded ground-truth fixtures; the live suite verifies real Grok
 honours that contract. No API key needed to run the tests.
@@ -167,9 +167,35 @@ A dashboard action never edits what the agents wrote. It lands as a
 
 ## Proposed — designed, not built
 
-### 17. Short-circuit an exact re-run before extraction
-Document identity is reliable now, so re-running an unchanged file could skip
-straight to the recorded outcome, saving all six Grok calls.
+### 17. Warn on an exact re-run before extraction — shipped, half of it
+Document identity is reliable, so the upload dialog hashes a file the moment it
+arrives — the same SHA-256 of loaded text that `documents` keys on — and says
+"these exact bytes have already been through the pipeline N times" *before* the
+user commits and six Grok calls are spent. `RunStore.document_history` is the
+read-only half of `register_document`, deliberately: registering at probe time
+would file a `documents` row whose `first_seen_path` names an upload the user is
+about to skip, corrupting the one table whose entire job is identity.
+
+Still proposed: the *automatic* short-circuit — returning the recorded outcome
+instead of re-running. Detection is now free; deciding that a re-run should
+silently answer from cache is a policy question, and today the human makes it.
+
+### 18. An upload inbox, so intake is not CLI-only — shipped
+The dashboard accepts files ([ui/app.py](../ui/app.py)) and a single background
+worker drains the queue through the same graph the CLI runs, one at a time,
+reporting the live node — `ingest → validate → decide → critique → pay` — onto
+the row as it goes. Three details worth defending:
+
+* **Serial is a correctness requirement, not a simplification.** Payment
+  idempotency is a read of `invoice_registry` in the `pay` node and a write of
+  it in `record` — two transactions. Two runs of one invoice number in flight
+  together could both conclude nothing had been paid.
+* **The pipeline is built on first dequeue, never at import.** A dashboard with
+  no `XAI_API_KEY` still renders, still accepts uploads, and reports the missing
+  key against the file that needed it rather than as a blank page.
+* **The stage reporter is a LangChain callback**, reading LangGraph's own
+  `langgraph_node` metadata, so it cannot drift from the topology the way a
+  hand-written string inside each node would. Same seam `recording.py` uses.
 
 ---
 

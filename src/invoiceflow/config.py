@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     # legacy system we validate against (docs/schema.md D1).
     runs_db_path: Path = PROJECT_ROOT / "invoiceflow.db"
     results_dir: Path = PROJECT_ROOT / "results"  # --export-json output
+    # Where the dashboard puts files handed to it. Kept out of data/invoices/
+    # on purpose: that directory is provided case material (.gitattributes
+    # marks it vendored), and what a user uploads is neither ours nor theirs.
+    uploads_dir: Path = PROJECT_ROOT / "data" / "uploads"
+
+    # The dashboard's background worker. Off in the test suite: AppTest drives
+    # the real script, and a thread outliving the test would keep polling a
+    # tmp_path database pytest has already deleted — and would build a real
+    # ChatXAI, because .env exports XAI_API_KEY into os.environ above.
+    inbox_worker: bool = True
 
     # Business rules
     scrutiny_threshold: float = 10_000.0  # invoices above this get extra scrutiny

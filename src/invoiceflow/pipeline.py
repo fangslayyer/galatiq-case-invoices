@@ -24,6 +24,7 @@ from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models import BaseChatModel
 from pydantic import SecretStr
 
@@ -91,7 +92,14 @@ class Pipeline:
     def backend(self) -> str:
         return getattr(self.llm, "model_name", None) or type(self.llm).__name__
 
-    def run(self, invoice_path: Path | str) -> InvoiceRunResult:
+    def run(
+        self,
+        invoice_path: Path | str,
+        *,
+        callbacks: list[BaseCallbackHandler] | None = None,
+    ) -> InvoiceRunResult:
+        """Process one invoice. `callbacks` rides alongside the telemetry
+        handler — how the dashboard watches a run advance node by node."""
         invoice_path = Path(invoice_path)
         run_id = f"{invoice_path.stem}-{uuid.uuid4().hex[:8]}"
         started = datetime.now(UTC).isoformat(timespec="seconds")
@@ -122,7 +130,7 @@ class Pipeline:
             # LangSmith tracer. Names and labels the trace tree when tracing
             # is on; inert otherwise.
             config={
-                "callbacks": [TelemetryHandler(recorder, self.backend)],
+                "callbacks": [TelemetryHandler(recorder, self.backend), *(callbacks or [])],
                 "run_name": f"invoice {invoice_path.name}",
                 "tags": ["invoiceflow", self.backend],
                 "metadata": {

@@ -12,6 +12,7 @@ htmlcov/
 inventory.db
 invoiceflow.db*
 results/
+data/uploads/
 
 # Secrets
 .env

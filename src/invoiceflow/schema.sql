@@ -281,6 +281,45 @@ CREATE TABLE human_reviews (
     note        TEXT    NOT NULL DEFAULT ''
 ) STRICT;
 
+-- One row per file a person handed the dashboard. Deliberately not a column on
+-- `runs`: an item exists before any run does, and one that never reaches a run
+-- at all — an unreadable PDF, a missing API key — still has to be visible and
+-- explainable to whoever uploaded it. `runs` records work done; this records
+-- work asked for.
+CREATE TABLE inbox_items (
+    id             INTEGER PRIMARY KEY,
+    filename       TEXT    NOT NULL,          -- exactly what the browser sent
+    -- Unique by construction: every upload gets its own directory, so the
+    -- vendor's filename survives collisions intact and still reads well inside
+    -- run_id, which pipeline.py builds from the path stem.
+    stored_path    TEXT    NOT NULL UNIQUE,
+    file_format    TEXT    NOT NULL CHECK (file_format IN ('txt','json','csv','xml','pdf')),
+    byte_size      INTEGER NOT NULL,
+    -- Of the loaded TEXT, not of the bytes: that is what documents.content_sha256
+    -- keys on, so the same invoice re-exported as a fresh PDF is still recognised
+    -- as the same document. Not a foreign key — the documents row is written by
+    -- the ingest node, which has not run yet when this row is created.
+    content_sha256 TEXT    NOT NULL,
+    -- How many runs this exact content already had when it was uploaded. >0 is
+    -- what the upload dialog warns about, before six Grok calls are spent.
+    prior_runs     INTEGER NOT NULL DEFAULT 0,
+    source         TEXT    NOT NULL DEFAULT 'upload'
+        CHECK (source IN ('upload','samples')),
+    -- 'processed' means a run happened and reached a verdict — NOT that the
+    -- verdict was good. A run that ended `failed` is a processed item with an
+    -- honest answer, which is a different fact from an item we never managed to
+    -- start at all. That one is 'failed' here.
+    state          TEXT    NOT NULL DEFAULT 'queued'
+        CHECK (state IN ('queued','processing','processed','failed')),
+    stage          TEXT    NOT NULL DEFAULT '',  -- live graph node while processing
+    run_id         INTEGER REFERENCES runs(id),
+    error          TEXT    NOT NULL DEFAULT '',
+    enqueued_at    TEXT    NOT NULL,
+    started_at     TEXT,
+    finished_at    TEXT,
+    dismissed_at   TEXT                        -- cleared from the list, never deleted
+) STRICT;
+
 -- ---------------------------------------------------------------------------
 -- Views
 -- ---------------------------------------------------------------------------
@@ -356,6 +395,20 @@ SELECT * FROM v_current_runs
 WHERE final_status = 'needs_review' AND human_reviewed_at IS NULL
 ORDER BY total DESC;
 
+-- What the Inbox tab reads: every upload with the outcome of the run it
+-- produced folded in. LEFT JOINs throughout — an item that has not run yet is
+-- the normal case, not a missing row. Dismissed rows drop out here and stay in
+-- the table.
+CREATE VIEW v_inbox AS
+SELECT ib.id, ib.filename, ib.file_format, ib.byte_size, ib.source, ib.state,
+       ib.stage, ib.error, ib.prior_runs, ib.enqueued_at, ib.started_at, ib.finished_at,
+       r.run_id, s.final_status, s.invoice_number, s.vendor, s.total, s.currency,
+       s.duration_ms, s.cost_usd, s.issue_count, s.document_run_no
+FROM inbox_items ib
+LEFT JOIN runs          r ON r.id = ib.run_id
+LEFT JOIN v_run_summary s ON s.run_id = r.run_id
+WHERE ib.dismissed_at IS NULL;
+
 -- Business impact: what actually goes wrong, most common first.
 CREATE VIEW v_issue_frequency AS
 SELECT ic.category, vi.code, vi.severity, vi.origin, COUNT(*) AS occurrences
@@ -430,3 +483,4 @@ CREATE INDEX idx_issues_code          ON validation_issues(code, severity);
 CREATE INDEX idx_overrides_run        ON decision_overrides(run_id);
 CREATE INDEX idx_overrides_invocation ON decision_overrides(invocation_id);
 CREATE INDEX idx_human_reviews_run    ON human_reviews(run_id);
+CREATE INDEX idx_inbox_state          ON inbox_items(state, id);

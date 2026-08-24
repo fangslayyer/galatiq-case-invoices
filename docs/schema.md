@@ -103,7 +103,9 @@ and in `v_reprocessed_documents`. Idempotency of *payment* is separate and uncha
 that is `invoice_registry`'s job.
 
 **D11. No migrations.** The DB is disposable and re-created by `--init-db`;
-there is no production data to preserve. One `schema.sql`, applied fresh.
+there is no production data to preserve. One `schema.sql`, applied fresh. The
+corollary is that a schema change means `--reset-db`, not a migration: nothing
+here has shipped, so every database is free to be a fresh one.
 
 ---
 
@@ -501,6 +503,78 @@ CREATE TABLE human_reviews (
 ) STRICT;
 ```
 
+### 4.11 The upload inbox
+
+The dashboard accepts uploads, so intake now has a state that predates any run.
+This is deliberately *not* derived from `runs`:
+
+* A queued file has no `runs` row at all. `begin_run` is called by the pipeline
+  once it starts, so everything between "uploaded" and "started" would be
+  invisible — which is exactly the window the inbox exists to show.
+* `runs.source_path` is where we stored the bytes. The name the person uploaded
+  is what they will scan the list for, and only this table keeps it.
+* An upload can fail before it is a run at all (unreadable PDF, unsupported
+  extension, no API key). That failure belongs to the file, not to a run that
+  never began.
+
+Note the asymmetry in `state`: **`processed` means a run happened and reached a
+verdict, not that the verdict was good.** A run that ended `failed` is a
+processed item — the pipeline did its job and gave an honest answer. `failed`
+here means we never got a run out of the file at all.
+
+`state` is mutable, like `invoice_registry` and unlike everything an agent
+produced (D2): it models where a file *is*, not what happened to it. What
+happened to it is the `runs` row this points at.
+
+```sql
+CREATE TABLE inbox_items (
+    id             INTEGER PRIMARY KEY,
+    filename       TEXT    NOT NULL,          -- exactly what the browser sent
+    -- Unique by construction: every upload gets its own directory, so the
+    -- vendor's filename survives collisions intact and still reads well inside
+    -- run_id, which pipeline.py builds from the path stem.
+    stored_path    TEXT    NOT NULL UNIQUE,
+    file_format    TEXT    NOT NULL CHECK (file_format IN ('txt','json','csv','xml','pdf')),
+    byte_size      INTEGER NOT NULL,
+    -- Of the loaded TEXT, not of the bytes: that is what documents.content_sha256
+    -- keys on, so the same invoice re-exported as a fresh PDF is still recognised
+    -- as the same document. Not a foreign key — the documents row is written by
+    -- the ingest node, which has not run yet when this row is created.
+    content_sha256 TEXT    NOT NULL,
+    -- How many runs this exact content already had when it was uploaded. >0 is
+    -- what the upload dialog warns about, before six Grok calls are spent.
+    prior_runs     INTEGER NOT NULL DEFAULT 0,
+    source         TEXT    NOT NULL DEFAULT 'upload'
+        CHECK (source IN ('upload','samples')),
+    -- 'processed' means a run happened and reached a verdict — NOT that the
+    -- verdict was good. A run that ended `failed` is a processed item with an
+    -- honest answer, which is a different fact from an item we never managed to
+    -- start at all. That one is 'failed' here.
+    state          TEXT    NOT NULL DEFAULT 'queued'
+        CHECK (state IN ('queued','processing','processed','failed')),
+    stage          TEXT    NOT NULL DEFAULT '',  -- live graph node while processing
+    run_id         INTEGER REFERENCES runs(id),
+    error          TEXT    NOT NULL DEFAULT '',
+    enqueued_at    TEXT    NOT NULL,
+    started_at     TEXT,
+    finished_at    TEXT,
+    dismissed_at   TEXT                        -- cleared from the list, never deleted
+) STRICT;
+```
+
+A worker claims the head of the queue with one atomic statement, so the claim
+can never be issued twice — the guarantee should not depend on there happening
+to be a single worker:
+
+    UPDATE inbox_items SET state = 'processing', started_at = ?, stage = ''
+    WHERE id = (SELECT id FROM inbox_items WHERE state = 'queued' ORDER BY id LIMIT 1)
+    RETURNING *
+
+`SELECT`-then-`UPDATE` would be wrong here for a subtle reason: that is a
+deferred transaction upgrading read→write, and SQLite does *not* invoke the
+busy handler for a snapshot-upgrade conflict, so `busy_timeout` would not cover
+it. One statement sidesteps the problem entirely.
+
 ---
 
 ## 5. Views the UI reads
@@ -580,6 +654,20 @@ CREATE VIEW v_review_queue AS
 SELECT * FROM v_current_runs
 WHERE final_status = 'needs_review' AND human_reviewed_at IS NULL
 ORDER BY total DESC;
+
+-- What the Inbox tab reads: every upload with the outcome of the run it
+-- produced folded in. LEFT JOINs throughout — an item that has not run yet is
+-- the normal case, not a missing row. Dismissed rows drop out here and stay in
+-- the table.
+CREATE VIEW v_inbox AS
+SELECT ib.id, ib.filename, ib.file_format, ib.byte_size, ib.source, ib.state,
+       ib.stage, ib.error, ib.prior_runs, ib.enqueued_at, ib.started_at, ib.finished_at,
+       r.run_id, s.final_status, s.invoice_number, s.vendor, s.total, s.currency,
+       s.duration_ms, s.cost_usd, s.issue_count, s.document_run_no
+FROM inbox_items ib
+LEFT JOIN runs          r ON r.id = ib.run_id
+LEFT JOIN v_run_summary s ON s.run_id = r.run_id
+WHERE ib.dismissed_at IS NULL;
 
 -- Business impact: what actually goes wrong, most common first.
 CREATE VIEW v_issue_frequency AS
@@ -661,6 +749,7 @@ CREATE INDEX idx_issues_code          ON validation_issues(code, severity);
 CREATE INDEX idx_overrides_run        ON decision_overrides(run_id);
 CREATE INDEX idx_overrides_invocation ON decision_overrides(invocation_id);
 CREATE INDEX idx_human_reviews_run    ON human_reviews(run_id);
+CREATE INDEX idx_inbox_state          ON inbox_items(state, id);
 ```
 
 ## 7. Connection setup
@@ -693,6 +782,7 @@ No migrations (D11): `--init-db` applies `schema.sql` to a fresh file, and
 | 5 | Dashboard reads views; human review writes `human_reviews` | Single source of truth |
 | 6 | `--export-json <run_id>` renders a run *from* the DB; `_persist` stops writing JSON | One writer, single-run traceability kept |
 | 7 | Load-time notice when `document_run_no > 1` — non-blocking, never a prompt | Accidental reprocessing is visible without breaking `--all` or scripting |
+| 8 | `inbox_items` + `v_inbox`; the dashboard uploads, queues and drains in the background | Intake stops being CLI-only |
 
 Phase 6 is the answer to "keep the JSON files?": keep the artifact, drop the
 second writer. A file rendered from the DB on demand cannot drift from it, which
