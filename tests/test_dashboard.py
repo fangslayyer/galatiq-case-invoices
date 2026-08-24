@@ -138,7 +138,7 @@ class TestUploadAndInbox:
         at.file_uploader[0].set_value(("invoice_1001.txt", data, "text/plain")).run()
         next(b for b in at.button if b.key == "inbox-check").click().run()
 
-        assert any("already been through the pipeline" in w.value for w in at.warning)
+        assert any("already processed" in w.value for w in at.warning)
         # Nothing fresh to queue, so only the explicit "queue all" escape hatch.
         keys = {b.key for b in at.button}
         assert "inbox-queue-all" in keys and "inbox-queue-new" not in keys

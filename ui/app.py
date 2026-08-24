@@ -28,7 +28,7 @@ from invoiceflow.models import FinalStatus, InvoiceRunResult, PaymentStatus, Sev
 from invoiceflow.review import apply_human_review
 from invoiceflow.runstore import RunStore
 
-st.set_page_config(page_title="InvoiceFlow", page_icon="🧾", layout="wide")
+st.set_page_config(page_title="ACME Corporation - InvoiceFlow", page_icon="🧾", layout="wide")
 
 STATUS_BADGE = {
     FinalStatus.PAID: "✅ paid",
@@ -73,19 +73,13 @@ store = RunStore(settings.runs_db_path)
 results = store.load_results()
 
 title_col, upload_col = st.columns([5, 1], vertical_alignment="bottom")
-title_col.title("🧾 InvoiceFlow")
-title_col.caption(
-    "Multi-agent invoice processing — ingestion → validation → approval → payment. "
-    f"{len(results)} recorded run(s)."
-)
-if upload_col.button("📤 Upload", type="primary", width="stretch", key="open-upload"):
+title_col.title("🧾 ACME Corporation - InvoiceFlow")
+title_col.caption("Automated invoice processing — upload, validate, approve, pay.")
+if upload_col.button("📤 Upload Invoices", type="primary", width="stretch", key="open-upload"):
     st.session_state[UPLOAD_OPEN] = True
 
 if not settings.db_path.exists():
-    st.warning(
-        "No inventory database — the Validator has nothing to check items against, so "
-        "anything processed now will fail. Run `uv run python main.py --init-db` first."
-    )
+    st.warning("Inventory database not found. Run `python main.py --init-db` to set it up.")
 
 
 def resolve(result: InvoiceRunResult, approve: bool, reviewer_note: str) -> bool:
@@ -110,11 +104,7 @@ def render_run(result: InvoiceRunResult, *, actionable: bool = False) -> None:
         # writes the invoice, validation, decision and trace in one transaction
         # at the end. Say so, rather than rendering a screen of blanks under
         # "run did not complete" — which reads as a failure and is not one.
-        st.info(
-            f"⚙️ **Still processing** — started {result.started_at}. The agents write "
-            "their findings in one transaction when the run lands, so this stays blank "
-            "until then. Watch it advance node by node in the 📥 Inbox tab."
-        )
+        st.info(f"Still processing — started {result.started_at}. Progress is in the Inbox.")
     left, right = st.columns([3, 2])
     with left:
         if inv is not None:
@@ -141,29 +131,29 @@ def render_run(result: InvoiceRunResult, *, actionable: bool = False) -> None:
             st.error(result.error)
     with right:
         if result.validation is not None:
-            st.markdown("**Validation**")
+            st.markdown("**Checks**")
             if result.validation.issues:
                 for issue in result.validation.issues:
                     st.markdown(f"{SEVERITY_ICON[issue.severity]} `{issue.code}` — {issue.detail}")
             else:
-                st.markdown("🟢 all checks passed")
+                st.markdown("🟢 All checks passed")
             st.caption(result.validation.summary)
         if result.decision is not None:
-            st.markdown("**Approval decision**")
+            st.markdown("**Decision**")
             st.markdown(result.decision.reasoning)
         for i, r in enumerate(result.critique_rounds, 1):
-            st.markdown(f"_Critique round {i}:_ **{r.critique.verdict}** — {r.critique.feedback}")
+            st.markdown(f"_Review round {i}:_ **{r.critique.verdict}** — {r.critique.feedback}")
         if result.payment is not None:
             # `amount` on a declined payment is what was claimed and refused,
             # not what moved — rendering both the same way is how $5,940 that
             # never left the bank read as a completed payment.
             pay = result.payment
             if pay.status == PaymentStatus.SUCCESS:
-                st.success(f"💸 Sent **${pay.amount:,.2f}** to {pay.vendor}")
+                st.success(f"💸 Paid **${pay.amount:,.2f}** to {pay.vendor}")
             else:
                 st.warning(
-                    f"🚫 Nothing sent to {pay.vendor} — the **${pay.amount:,.2f}** claimed "
-                    f"was declined ({pay.status.replace('_', ' ')})"
+                    f"🚫 Declined — **${pay.amount:,.2f}** to {pay.vendor} was not sent "
+                    f"({pay.status.replace('_', ' ')})"
                 )
         for hr in result.human_reviews:
             st.info(
@@ -171,7 +161,7 @@ def render_run(result: InvoiceRunResult, *, actionable: bool = False) -> None:
                 f"{hr.from_status} → {hr.to_status}" + (f" — {hr.note}" if hr.note else "")
             )
 
-    with st.expander("Full agent trace"):
+    with st.expander("Activity log"):
         for ev in result.trace:
             st.text(f"[{ev.stage:>10}] {ev.event}  {ev.detail}")
 
@@ -182,8 +172,8 @@ def render_run(result: InvoiceRunResult, *, actionable: bool = False) -> None:
         pay_label = "✅ Overturn & pay" if rejected else "✅ Approve & pay"
         reject_label = "⛔ Confirm rejection" if rejected else "⛔ Reject"
         if result.human_reviewed_at:
-            st.caption(f"Reviewed by a human at {result.human_reviewed_at}")
-        note = st.text_input("Reviewer note", key=f"note-{result.run_id}")
+            st.caption(f"Reviewed {result.human_reviewed_at}")
+        note = st.text_input("Note", key=f"note-{result.run_id}", placeholder="Optional")
         a, b = st.columns(2)
         # Only rerun when the review landed: a rerun would wipe the error
         # explaining why it did not.
@@ -244,11 +234,7 @@ def close_upload() -> None:
 @st.dialog("Upload invoices", width="large", on_dismiss=close_upload)
 def upload_dialog() -> None:
     if not settings.resolve_api_key():
-        st.warning(
-            "No XAI_API_KEY is set, so nothing queued here can be processed — Grok is "
-            "the pipeline's only reasoning engine and there is no fallback parser. You "
-            "can still upload; the files will wait."
-        )
+        st.warning("Processing is unavailable — no API key configured. Files will queue.")
     probes: list[UploadProbe] = st.session_state.get(PROBES, [])
     if not probes:
         files = st.file_uploader(
@@ -259,8 +245,8 @@ def upload_dialog() -> None:
             accept_multiple_files=True,
             key="inbox-uploader",
         )
-        st.caption(f"Accepted: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
-        if files and st.button("Check files", type="primary", key="inbox-check"):
+        st.caption(f"Accepted: {', '.join(sorted(e.lstrip('.') for e in SUPPORTED_EXTENSIONS))}")
+        if files and st.button("Continue", type="primary", key="inbox-check"):
             # Saved before they are read: load_invoice_text takes a path and
             # pdfplumber wants a real file. Anything the user then skips is
             # deleted again — cheaper than a temp-file dance across 5 formats.
@@ -275,7 +261,7 @@ def upload_dialog() -> None:
             # fragment-scoped rerun is only legal during a fragment rerun,
             # which is not what a click through AppTest produces.
             st.rerun()
-        if st.button("Load the 20 sample invoices", key="inbox-samples"):
+        if st.button("Load sample invoices", key="inbox-samples"):
             sample_probes = [
                 inbox.probe_upload(store, path)
                 for path in sorted((PROJECT_ROOT / "data" / "invoices").iterdir())
@@ -292,21 +278,20 @@ def upload_dialog() -> None:
     readable = [p for p in probes if p.readable]
     for probe in probes:
         if not probe.readable:
-            st.error(f"**{probe.filename}** — {probe.error}")
+            st.error(f"**{probe.filename}** — cannot be read. {probe.error}")
         elif probe.is_rerun:
             st.warning(
-                f"**{probe.filename}** — these exact bytes have already been through the "
-                f"pipeline {probe.prior_runs} time(s). Running them again costs six Grok "
-                f"calls and reaches the same answer."
+                f"**{probe.filename}** — already processed {probe.prior_runs} time(s) before. "
+                "Processing it again will reach the same result."
             )
         else:
-            st.success(f"**{probe.filename}** — {probe.byte_size:,} bytes, ready.")
+            st.success(f"**{probe.filename}** — {probe.byte_size:,} bytes")
 
     fresh = [p for p in readable if not p.is_rerun]
     a, b, c = st.columns(3)
-    if fresh and a.button(f"Queue {len(fresh)} new", type="primary", key="inbox-queue-new"):
+    if fresh and a.button(f"Upload {len(fresh)} new", type="primary", key="inbox-queue-new"):
         queue_files(fresh, discard=[p for p in probes if p not in fresh])
-    if readable and b.button(f"Queue all {len(readable)}", key="inbox-queue-all"):
+    if readable and b.button(f"Upload all {len(readable)}", key="inbox-queue-all"):
         queue_files(readable, discard=[p for p in probes if not p.readable])
     if c.button("Cancel", key="inbox-cancel"):
         queue_files([], discard=probes)
@@ -336,20 +321,19 @@ tab_inbox, tab_queue, tab_rejected, tab_runs, tab_db = st.tabs(
 )
 
 with tab_inbox:
-    st.caption(
-        "Uploaded files are processed one at a time, in the background, by the same "
-        "pipeline the CLI runs — the queue is the only difference. Serial on purpose: "
-        "payment idempotency is a read of the registry in `pay` and a write of it in "
-        "`record`, so two runs of one invoice number in flight together could both "
-        "conclude nothing had been paid."
-    )
+    st.caption("Uploaded files, processed in the background one at a time.")
 
     @st.fragment(run_every=refresh)
     def inbox_panel() -> None:
         rows = store.inbox_rows()
         if not rows:
-            st.info("Nothing uploaded yet. Use 📤 Upload, top right.")
+            st.info("No uploads yet. Use 📤 Upload, top right.")
             return
+        finished = [r for r in rows if r["state"] in ("processed", "failed")]
+        if finished and st.button("Clear all", key="inbox-clear-all"):
+            for r in finished:
+                store.dismiss_upload(r["id"])
+            st.rerun()
         st.dataframe(
             [
                 {
@@ -363,28 +347,13 @@ with tab_inbox:
                     "total": f"{r['currency']} {r['total']:,.2f}" if r["total"] else "—",
                     "seconds": round((r["duration_ms"] or 0) / 1000, 1) or "—",
                     "cost": f"${r['cost_usd']:.4f}" if r["cost_usd"] else "—",
-                    "note": r["error"]
-                    or ("re-run of a document already processed" if r["prior_runs"] else ""),
+                    "note": r["error"] or ("Duplicate submission" if r["prior_runs"] else ""),
                 }
                 for r in rows
             ],
             width="stretch",
             hide_index=True,
         )
-        for r in rows:
-            if r["state"] not in ("failed", "processed"):
-                continue
-            left, right, _ = st.columns([1, 1, 6])
-            if r["state"] == "failed" and left.button(
-                "↻ Retry", key=f"retry-{r['id']}", help=r["filename"]
-            ):
-                store.requeue_upload(r["id"])
-                if worker is not None:
-                    worker.wake()
-                st.rerun()
-            if right.button("✕ Dismiss", key=f"dismiss-{r['id']}", help=r["filename"]):
-                store.dismiss_upload(r["id"])
-                st.rerun()
         if refresh and not any(r["state"] in ("queued", "processing") for r in rows):
             # The queue drained. Only a *full* app run takes the browser's
             # polling timer down, and the other tabs are stale anyway — they
@@ -396,7 +365,9 @@ with tab_inbox:
 with tab_queue:
     queue = store.review_queue()
     if not queue:
-        st.success("Queue is empty — nothing needs human review.")
+        st.success("Nothing needs review.")
+    else:
+        st.caption("These need a decision before any money moves.")
     for result in queue:
         with st.container(border=True):
             st.subheader(run_header(result))
@@ -405,11 +376,7 @@ with tab_queue:
 with tab_rejected:
     # Kept out of the escalation queue on purpose: the queue means "this needs a
     # decision from you", these are decided and merely open to being overturned.
-    st.caption(
-        "Rejected automatically by the hard business rules. Nothing here is waiting "
-        "on you — overturn one that is wrong, or confirm it so it stops showing as "
-        "unchecked."
-    )
+    st.caption("Rejected automatically. Overturn one that is wrong, or confirm it.")
     if not rejected:
         st.info("No rejected runs.")
     for result in rejected:
@@ -422,10 +389,7 @@ with tab_runs:
     if not results:
         # The old st.stop() lived at the top of the script and hid the whole
         # app in this state — including the upload button that fixes it.
-        st.info(
-            "No runs yet. Upload a file with 📤 Upload, or process the samples:\n\n"
-            "```\nuv run python main.py --init-db\nuv run python main.py --all\n```"
-        )
+        st.info("No runs yet. Use 📤 Upload to add invoices, or load the samples.")
     counts: dict[FinalStatus, int] = {}
     running = 0
     for r in results:
@@ -443,8 +407,7 @@ with tab_runs:
     st.metric(
         "Money sent",
         " · ".join(f"{cur} {amt:,.2f}" for cur, amt in sorted(sent.items())) if sent else "—",
-        help="Successful payments only. A declined payment records the sum it refused, "
-        "which is not money that moved.",
+        help="Successful payments only. A declined payment is not money that moved.",
     )
     options = {
         f"{IN_FLIGHT_BADGE if in_flight(r) else STATUS_BADGE[r.final_status]} · "
@@ -462,17 +425,17 @@ with tab_db:
         width="stretch",
         hide_index=True,
     )
-    st.markdown("**Processed-invoice registry**")
+    st.markdown("**Processed invoices**")
     with store.connect() as conn:
         rows = [dict(r) for r in conn.execute("SELECT * FROM invoice_registry").fetchall()]
     st.dataframe(rows, width="stretch", hide_index=True)
 
-    st.markdown("**Cost by agent** · from `v_cost_by_agent`")
+    st.markdown("**Cost by agent**")
     with store.connect() as conn:
         rows = [dict(r) for r in conn.execute("SELECT * FROM v_cost_by_agent").fetchall()]
     st.dataframe(rows, width="stretch", hide_index=True)
 
-    st.markdown("**Issue frequency** · from `v_issue_frequency`")
+    st.markdown("**Most common issues**")
     with store.connect() as conn:
         rows = [dict(r) for r in conn.execute("SELECT * FROM v_issue_frequency").fetchall()]
     st.dataframe(rows, width="stretch", hide_index=True)
@@ -483,5 +446,5 @@ with tab_db:
             dict(r) for r in conn.execute("SELECT * FROM v_reprocessed_documents").fetchall()
         ]
     if reprocessed:
-        st.markdown("**Reprocessed documents** · same content, multiple runs")
+        st.markdown("**Duplicate submissions**")
         st.dataframe(reprocessed, width="stretch", hide_index=True)
